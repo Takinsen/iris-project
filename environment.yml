@@ -11,3 +11,4 @@ dependencies:
   - pip:
     - open-iris
     - kagglehub
+    - scikit-learn

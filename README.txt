@@ -3,8 +3,8 @@
 ----------------------------------------------------------------------------------------
 1. Requirement 
 	- Anaconda prompt
-	- Python 3.11
-	- iris-dev ( open-iris environment in Anaconda )
+	- Python 3.10
+	- conda environment: iris-dev (from environment.yml)
 	- iris dataset ( clean black & white up to usage of worldcoin )
 	- numpy, pandas, matplotlib
 ----------------------------------------------------------------------------------------
@@ -14,9 +14,11 @@
 ----------------------------------------------------------------------------------------
 3. How to run 
 	1. Open anaconda prompt
-	2. Activate environment	-> type "conda activate iris_dev" 
-	3. Go to the project directory -> type "cd <location of project folder>
-	4. Run the script -> type "python <file name we gonna run>.py"
+	2. Go to the project directory -> type "cd <location of project folder>"
+	3. Create environment (first time only) -> type "conda env create -f environment.yml"
+	4. Activate environment -> type "conda activate iris-dev"
+	5. Run the script -> type "python baseline_casia_thousand_multiset.py"
+	6. Optional environment update after dependency changes -> type "conda env update -f environment.yml --prune"
 ----------------------------------------------------------------------------------------
 4. Configuration
 	1. DATASET_ROOT -> Path to the CASIA-Iris-Thousand dataset

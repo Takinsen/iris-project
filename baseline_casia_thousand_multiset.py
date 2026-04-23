@@ -16,7 +16,6 @@ import kagglehub
 # Download latest version
 path = kagglehub.dataset_download("sondosaabed/casia-iris-thousand")
 
-
 # -----------------------------
 # Config
 # -----------------------------
@@ -27,7 +26,7 @@ CACHE_DIR = r".\cache_templates_CASIA_Iris_Thousand_Baseline"
 TARGET_EYE_SIDE = "L"
 SUBJECTS_PER_SET = 9
 IMAGES_PER_SUBJECT = 10
-MAX_SETS = None  # None = use as many full non-overlapping sets as possible
+MAX_SETS = 20  # None = use as many full non-overlapping sets as possible
 THRESHOLD = 0.38
 
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
@@ -86,6 +85,48 @@ class CachedTemplate:
 # -----------------------------
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def count_subject_like_dirs(root_dir: str) -> int:
+    """Count child folders that look like subject folders (contain L or R eye dirs)."""
+    if not os.path.isdir(root_dir):
+        return 0
+
+    count = 0
+    for name in os.listdir(root_dir):
+        subject_path = os.path.join(root_dir, name)
+        if not os.path.isdir(subject_path):
+            continue
+        if os.path.isdir(os.path.join(subject_path, "L")) or os.path.isdir(os.path.join(subject_path, "R")):
+            count += 1
+    return count
+
+
+def resolve_dataset_root(download_root: str) -> str:
+    """Resolve the actual subject root when datasets are wrapped in an extra top-level folder."""
+    if not os.path.isdir(download_root):
+        raise FileNotFoundError(f"Dataset root not found: {download_root}")
+
+    current = download_root
+    for _ in range(8):
+        score = count_subject_like_dirs(current)
+        if score > 0:
+            return current
+
+        child_dirs = [
+            os.path.join(current, name)
+            for name in sorted(os.listdir(current))
+            if os.path.isdir(os.path.join(current, name))
+        ]
+
+        # Common packaging pattern: one wrapper directory level (sometimes repeated).
+        if len(child_dirs) == 1:
+            current = child_dirs[0]
+            continue
+
+        break
+
+    return current
 
 
 def list_subject_dirs(dataset_root: str) -> List[str]:
@@ -439,6 +480,20 @@ def label_pair(a: SelectedImageRecord, b: SelectedImageRecord) -> str:
 
 def extract_unique_pair_records(distance_matrix_df: pd.DataFrame, selected_images: List[SelectedImageRecord]) -> pd.DataFrame:
     records = []
+    columns = [
+        "set_id",
+        "img1_label",
+        "img2_label",
+        "subject1",
+        "subject2",
+        "eye_side1",
+        "eye_side2",
+        "image1_name",
+        "image2_name",
+        "distance",
+        "pair_type",
+        "true_label",
+    ]
     by_label = {rec.image_label: rec for rec in selected_images}
     labels = list(distance_matrix_df.index)
 
@@ -463,7 +518,7 @@ def extract_unique_pair_records(distance_matrix_df: pd.DataFrame, selected_image
                     "true_label": 1 if pair_type == "genuine" else 0,
                 }
             )
-    return pd.DataFrame(records)
+    return pd.DataFrame(records, columns=columns)
 
 
 def safe_mean(series: pd.Series) -> float:
@@ -632,8 +687,12 @@ def main() -> None:
     if USE_CACHE:
         ensure_dir(CACHE_DIR)
 
+    resolved_dataset_root = resolve_dataset_root(DATASET_ROOT)
+
     print("=== CASIA-Iris-Thousand Multi-Set Balanced Evaluation ===")
     print(f"Dataset root        : {DATASET_ROOT}")
+    if resolved_dataset_root != DATASET_ROOT:
+        print(f"Resolved data root  : {resolved_dataset_root}")
     print(f"Output root         : {OUTPUT_ROOT}")
     print(f"Subjects per set    : {SUBJECTS_PER_SET}")
     print(f"Images per subject  : {IMAGES_PER_SUBJECT}")
@@ -647,7 +706,7 @@ def main() -> None:
     matcher = HammingDistanceMatcher()
 
     all_sets, _ = build_sets_from_dataset(
-        dataset_root=DATASET_ROOT,
+        dataset_root=resolved_dataset_root,
         subjects_per_set=SUBJECTS_PER_SET,
         images_per_subject=IMAGES_PER_SUBJECT,
         eye_side=TARGET_EYE_SIDE,
@@ -656,7 +715,12 @@ def main() -> None:
     )
 
     if not all_sets:
-        raise RuntimeError("No complete sets could be built with the current policy.")
+        detected_subjects = count_subject_like_dirs(resolved_dataset_root)
+        raise RuntimeError(
+            "No complete sets could be built with the current policy. "
+            f"Detected {detected_subjects} subject-like folders under: {resolved_dataset_root}. "
+            "Try reducing SUBJECTS_PER_SET or IMAGES_PER_SUBJECT, or verify TARGET_EYE_SIDE."
+        )
 
     all_summaries = []
     for set_data in all_sets:
