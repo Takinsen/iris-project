@@ -1,5 +1,6 @@
 import os
 import glob
+import time
 
 import numpy as np
 import pandas as pd
@@ -205,7 +206,44 @@ def plot_distance_boxplots(summary: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------
-# Plot 6 — Aggregate confusion matrix
+# Plot 6 — FAR / FRR per set
+# ------------------------------------------------------------------
+
+def compute_far_frr(summary: pd.DataFrame) -> pd.DataFrame:
+    df = summary.copy()
+    df["far"] = df["FP"] / (df["FP"] + df["TN"])   # FP / total impostor
+    df["frr"] = df["FN"] / (df["FN"] + df["TP"])   # FN / total genuine
+    return df
+
+
+def plot_far_frr_per_set(summary: pd.DataFrame) -> None:
+    df = compute_far_frr(summary)
+    sets = df["set_id"].tolist()
+    x = np.arange(len(sets))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(12, len(sets) * 0.7), 5))
+    ax.bar(x - width / 2, df["far"] * 100, width, color="#C44E52", label="FAR (False Acceptance Rate)")
+    ax.bar(x + width / 2, df["frr"] * 100, width, color="#8172B2", label="FRR (False Rejection Rate)")
+
+    eer_line = ((df["far"] + df["frr"]) / 2 * 100).mean()
+    ax.axhline(eer_line, color="gray", linestyle=":", linewidth=1, label=f"Mean (FAR+FRR)/2 ≈ {eer_line:.3f}%")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sets, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Error Rate (%)")
+    ax.set_title("FAR & FRR per Set (at fixed threshold)")
+    ax.legend(fontsize=8)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(os.path.join(VIZ_DIR, "far_frr_per_set.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  saved: far_frr_per_set.png")
+
+
+# ------------------------------------------------------------------
+# Plot 7 — Aggregate confusion matrix
 # ------------------------------------------------------------------
 
 def plot_aggregate_confusion_matrix(summary: pd.DataFrame) -> None:
@@ -242,7 +280,7 @@ def plot_aggregate_confusion_matrix(summary: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------
-# Plot 7 — Summary dashboard (all key stats in one figure)
+# Plot 8 — Summary dashboard (all key stats in one figure)
 # ------------------------------------------------------------------
 
 def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
@@ -322,15 +360,17 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
                      color="white" if vals[i, j] > thresh_cm else "black", fontsize=10, fontweight="bold")
     ax5.set_title("Aggregate Confusion Matrix", fontsize=9)
 
-    # --- bottom-right: aggregate metric summary table ---
+    # --- bottom-right: aggregate metric summary table (includes FAR/FRR) ---
+    df_far_frr = compute_far_frr(summary)
     ax6 = fig.add_subplot(gs[1, 2])
     ax6.axis("off")
-    metric_cols = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
+    metric_cols = ["accuracy", "f1", "balanced_accuracy", "far", "frr"]
+    metric_labels = ["Accuracy", "F1", "Bal. Acc.", "FAR", "FRR"]
     table_data = []
-    for col in metric_cols:
-        vals_col = summary[col].dropna()
+    for col, label in zip(metric_cols, metric_labels):
+        vals_col = df_far_frr[col].dropna()
         table_data.append([
-            col.replace("_", "\n"),
+            label,
             f"{vals_col.mean():.4f}",
             f"{vals_col.std():.4f}",
             f"{vals_col.min():.4f}",
@@ -353,6 +393,87 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------
+# Plot 9 — Matching latency (pairs/sec throughput per set)
+# ------------------------------------------------------------------
+
+def measure_and_plot_latency(summary: pd.DataFrame) -> None:
+    """
+    Estimates matching throughput by timing how long it takes to re-read and
+    process each set's pair_records.csv.  Reports pairs/sec as a proxy for
+    the evaluation phase latency.  True template-generation latency requires
+    instrumentation inside baseline_casia_thousand_multiset.py.
+    """
+    set_ids, pairs_per_sec, load_times_ms = [], [], []
+
+    pattern = os.path.join(OUTPUT_ROOT, "**", "pair_records.csv")
+    for fpath in sorted(glob.glob(pattern, recursive=True)):
+        t0 = time.perf_counter()
+        df = pd.read_csv(fpath)
+        if len(df) == 0:
+            continue
+        _ = (df["distance"] <= df["distance"].median()).sum()   # simulate threshold scan
+        elapsed = time.perf_counter() - t0
+
+        set_id = df["set_id"].iloc[0]
+        n_pairs = len(df)
+        set_ids.append(set_id)
+        pairs_per_sec.append(n_pairs / elapsed)
+        load_times_ms.append(elapsed * 1000)
+
+    if not set_ids:
+        return
+
+    x = np.arange(len(set_ids))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Evaluation Latency (pair-record load + threshold scan)", fontsize=11)
+
+    # Left: pairs per second
+    ax1.bar(x, pairs_per_sec, color="#4C72B0")
+    ax1.axhline(np.mean(pairs_per_sec), color="crimson", linestyle="--",
+                linewidth=1.2, label=f"Mean: {np.mean(pairs_per_sec):,.0f} pairs/s")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(set_ids, rotation=45, ha="right", fontsize=7)
+    ax1.set_ylabel("Pairs per Second")
+    ax1.set_title("Throughput per Set")
+    ax1.legend(fontsize=8)
+    ax1.yaxis.grid(True, linestyle="--", alpha=0.4)
+    ax1.set_axisbelow(True)
+
+    # Right: wall-clock ms per set
+    ax2.bar(x, load_times_ms, color="#55A868")
+    ax2.axhline(np.mean(load_times_ms), color="crimson", linestyle="--",
+                linewidth=1.2, label=f"Mean: {np.mean(load_times_ms):.1f} ms/set")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(set_ids, rotation=45, ha="right", fontsize=7)
+    ax2.set_ylabel("Time (ms)")
+    ax2.set_title("Evaluation Time per Set")
+    ax2.legend(fontsize=8)
+    ax2.yaxis.grid(True, linestyle="--", alpha=0.4)
+    ax2.set_axisbelow(True)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(VIZ_DIR, "latency_per_set.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  saved: latency_per_set.png")
+
+    latency_df = pd.DataFrame({
+        "set_id": set_ids,
+        "n_pairs": [int(summary.loc[summary["set_id"] == s, "total_unique_pairs"].iloc[0])
+                    if s in summary["set_id"].values else None for s in set_ids],
+        "eval_time_ms": [round(t, 3) for t in load_times_ms],
+        "pairs_per_sec": [round(p, 1) for p in pairs_per_sec],
+        "us_per_pair": [round(t * 1000 / p * 1000, 3) for t, p in zip(load_times_ms, pairs_per_sec)],
+    })
+    latency_df.to_csv(os.path.join(VIZ_DIR, "latency_summary.csv"), index=False)
+    print("  saved: latency_summary.csv")
+
+    total_pairs = latency_df["n_pairs"].sum()
+    total_ms = latency_df["eval_time_ms"].sum()
+    print(f"  total: {total_pairs:,} pairs in {total_ms:.1f} ms "
+          f"({total_pairs / (total_ms / 1000):,.0f} pairs/s overall)")
+
+
+# ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
 
@@ -371,8 +492,10 @@ def main() -> None:
     plot_roc_curve(pairs)
     plot_det_curve(pairs)
     plot_distance_boxplots(summary)
+    plot_far_frr_per_set(summary)
     plot_aggregate_confusion_matrix(summary)
     plot_dashboard(summary, pairs)
+    measure_and_plot_latency(summary)
 
     print("\nDone.")
 
