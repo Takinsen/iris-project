@@ -10,6 +10,38 @@ The script runs a multi-set iris verification experiment on the CASIA-Iris-Thous
 
 ---
 
+## Terminology
+
+| Term | Meaning |
+|---|---|
+| **Subject** | A single person in the dataset. Each subject has a folder (e.g. `001/`) containing their iris images. One subject = one identity. Controlled by `SUBJECTS_PER_SET`. |
+| **Image** | One iris photograph of a subject's eye (e.g. `S5001L00.jpg`). Multiple photos are taken per subject per eye side. Controlled by `IMAGES_PER_SUBJECT`. |
+| **Set** | A self-contained evaluation group of `SUBJECTS_PER_SET` subjects × `IMAGES_PER_SUBJECT` images. Sets are non-overlapping — each subject appears in at most one set. Controlled by `MAX_SETS`. |
+| **Genuine pair** | A comparison between two images from the **same subject and same eye side**. Expected to have a low Hamming distance (similar irises). |
+| **Impostor pair** | A comparison between two images from **different subjects**. Expected to have a high Hamming distance (different irises). |
+| **Hamming distance** | A value in [0, 1] measuring how different two IrisCode templates are. Lower = more similar. |
+| **Threshold** | The Hamming distance cut-off. Pairs with distance ≤ threshold are classified as a match (genuine); pairs above are classified as non-match (impostor). |
+| **IrisTemplate / IrisCode** | The binary biometric code produced by the Open-Iris pipeline for one iris image. Used as the unit of comparison. |
+
+**Example with defaults** (`SUBJECTS_PER_SET=9`, `IMAGES_PER_SUBJECT=10`, `MAX_SETS=20`):
+
+```
+Set 01
+├── Subject 001 → 10 images
+├── Subject 002 → 10 images
+├── ...
+└── Subject 009 → 10 images
+      ↓
+  90 images total
+  Genuine pairs:  9 × C(10,2) = 9 × 45 =   405
+  Impostor pairs: C(90,2) − 405         = 3,600
+  Total pairs:                             4,005
+
+Full run: 20 sets × 9 subjects × 10 images = 1,800 images, 80,100 pairs
+```
+
+---
+
 ## Configuration (Input)
 
 All parameters are defined at the top of the script.
