@@ -32,7 +32,7 @@ VALID_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 USE_CACHE = True
 OVERWRITE_CACHE = False
 
-FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson", "tanimoto"]
+FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson"]
 
 
 # -----------------------------
@@ -540,7 +540,8 @@ def extract_valid_bits(
 
     a_codes, a_masks = _flatten(tpl_a.iris_codes, tpl_a.mask_codes)
     b_codes, b_masks = _flatten(tpl_b.iris_codes, tpl_b.mask_codes)
-    valid = ~(a_masks | b_masks)
+    # mask_codes=True means the bit IS valid (unoccluded) in open-iris convention
+    valid = a_masks & b_masks
     return a_codes[valid], b_codes[valid]
 
 
@@ -569,12 +570,7 @@ def compute_extra_scores(
     sa, sb = float(a.std()), float(b.std())
     pearson = 1.0 - float(np.corrcoef(a, b)[0, 1]) if (sa > 0 and sb > 0) else 1.0
 
-    # Tanimoto (generalized, real-valued)
-    aa, bb = float(np.dot(a, a)), float(np.dot(b, b))
-    tan_denom = aa + bb - dot
-    tanimoto = 1.0 - (dot / tan_denom) if tan_denom > 0 else 1.0
-
-    return {"jaccard": jaccard, "cosine": cosine, "pearson": pearson, "tanimoto": tanimoto}
+    return {"jaccard": jaccard, "cosine": cosine, "pearson": pearson}
 
 
 def build_multi_score_pair_df(
