@@ -10,7 +10,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import iris
 from iris.nodes.matcher.hamming_distance_matcher import HammingDistanceMatcher
-
 import kagglehub
 
 # Download latest version
@@ -24,14 +23,16 @@ OUTPUT_ROOT = r".\out_CASIA_Iris_Thousand_MultiSet_L"
 CACHE_DIR = r".\cache_templates_CASIA_Iris_Thousand_Baseline"
 
 TARGET_EYE_SIDE = "L"
-SUBJECTS_PER_SET = 9
+SUBJECTS_PER_SET = 50
 IMAGES_PER_SUBJECT = 10
-MAX_SETS = 20  # None = use as many full non-overlapping sets as possible
+MAX_SETS = 10  # None = use as many full non-overlapping sets as possible
 THRESHOLD = 0.38
 
 VALID_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 USE_CACHE = True
 OVERWRITE_CACHE = False
+
+FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson", "tanimoto"]
 
 
 # -----------------------------
@@ -521,6 +522,98 @@ def extract_unique_pair_records(distance_matrix_df: pd.DataFrame, selected_image
     return pd.DataFrame(records, columns=columns)
 
 
+# -----------------------------
+# Multi-score metrics
+# -----------------------------
+
+def extract_valid_bits(
+    tpl_a: iris.IrisTemplate,
+    tpl_b: iris.IrisTemplate,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return the bit arrays at positions that are unmasked in both templates."""
+    def _flatten(codes, masks):
+        if isinstance(codes, np.ndarray):
+            return codes.flatten().astype(np.float32), masks.flatten().astype(bool)
+        c = np.concatenate([x.flatten() for x in codes]).astype(np.float32)
+        m = np.concatenate([x.flatten() for x in masks]).astype(bool)
+        return c, m
+
+    a_codes, a_masks = _flatten(tpl_a.iris_codes, tpl_a.mask_codes)
+    b_codes, b_masks = _flatten(tpl_b.iris_codes, tpl_b.mask_codes)
+    valid = ~(a_masks | b_masks)
+    return a_codes[valid], b_codes[valid]
+
+
+def compute_extra_scores(
+    tpl_a: iris.IrisTemplate,
+    tpl_b: iris.IrisTemplate,
+) -> Dict[str, float]:
+    """Compute Jaccard, Cosine, Pearson and Tanimoto distances for a pre-deserialized pair."""
+    a, b = extract_valid_bits(tpl_a, tpl_b)
+    if len(a) == 0:
+        return {"jaccard": np.nan, "cosine": np.nan, "pearson": np.nan, "tanimoto": np.nan}
+
+    a_bin, b_bin = a > 0.5, b > 0.5
+
+    # Jaccard (binary)
+    inter = float(np.sum(a_bin & b_bin))
+    union = float(np.sum(a_bin | b_bin))
+    jaccard = 1.0 - (inter / union) if union > 0 else 1.0
+
+    # Cosine
+    dot = float(np.dot(a, b))
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    cosine = 1.0 - (dot / (na * nb)) if (na * nb) > 0 else 1.0
+
+    # Pearson correlation distance
+    sa, sb = float(a.std()), float(b.std())
+    pearson = 1.0 - float(np.corrcoef(a, b)[0, 1]) if (sa > 0 and sb > 0) else 1.0
+
+    # Tanimoto (generalized, real-valued)
+    aa, bb = float(np.dot(a, a)), float(np.dot(b, b))
+    tan_denom = aa + bb - dot
+    tanimoto = 1.0 - (dot / tan_denom) if tan_denom > 0 else 1.0
+
+    return {"jaccard": jaccard, "cosine": cosine, "pearson": pearson, "tanimoto": tanimoto}
+
+
+def build_multi_score_pair_df(
+    selected_images: List[SelectedImageRecord],
+    templates_by_label: Dict[str, CachedTemplate],
+    distance_matrix_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build a per-pair DataFrame with hamming + extra distance scores as features."""
+    labels = [rec.image_label for rec in selected_images]
+    by_label = {rec.image_label: rec for rec in selected_images}
+
+    # Deserialize each template exactly once
+    deserialized = {
+        lbl: deserialize_template(templates_by_label[lbl].iris_template_bytes)
+        for lbl in labels
+    }
+
+    records = []
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            la, lb = labels[i], labels[j]
+            rec_i, rec_j = by_label[la], by_label[lb]
+            pair_type = label_pair(rec_i, rec_j)
+            hamming = float(distance_matrix_df.at[la, lb])
+            extra = compute_extra_scores(deserialized[la], deserialized[lb])
+            records.append({
+                "set_id": rec_i.set_id,
+                "img1_label": la,
+                "img2_label": lb,
+                "pair_type": pair_type,
+                "true_label": 1 if pair_type == "genuine" else 0,
+                "hamming": hamming,
+                **extra,
+            })
+
+    return pd.DataFrame(records, columns=["set_id", "img1_label", "img2_label",
+                                           "pair_type", "true_label"] + FEATURE_COLS)
+
+
 def safe_mean(series: pd.Series) -> float:
     return float(series.mean()) if len(series) > 0 else np.nan
 
@@ -638,7 +731,13 @@ def save_confusion_matrix_plot(confusion_matrix_df: pd.DataFrame, out_path: str)
     plt.close(fig)
 
 
-def save_set_outputs(set_data: dict, set_output_dir: str, threshold: float, eye_side: str, matcher: HammingDistanceMatcher) -> pd.DataFrame:
+def save_set_outputs(
+    set_data: dict,
+    set_output_dir: str,
+    threshold: float,
+    eye_side: str,
+    matcher: HammingDistanceMatcher,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     ensure_dir(set_output_dir)
 
     selected_images = set_data["selected_images"]
@@ -676,7 +775,11 @@ def save_set_outputs(set_data: dict, set_output_dir: str, threshold: float, eye_
     save_dataframe(confusion_df, os.path.join(set_output_dir, "confusion_matrix.csv"), index=True)
     save_confusion_matrix_plot(confusion_df, os.path.join(set_output_dir, "confusion_matrix.png"))
 
-    return summary_df
+    # multi-score features for fusion
+    multi_score_df = build_multi_score_pair_df(selected_images, templates_by_label, distance_matrix_df)
+    save_dataframe(multi_score_df, os.path.join(set_output_dir, "multi_score_features.csv"))
+
+    return summary_df, multi_score_df
 
 
 # -----------------------------
@@ -722,13 +825,17 @@ def main() -> None:
             "Try reducing SUBJECTS_PER_SET or IMAGES_PER_SUBJECT, or verify TARGET_EYE_SIDE."
         )
 
-    all_summaries = []
+    all_summaries: List[pd.DataFrame] = []
+    all_multi_score_dfs: List[pd.DataFrame] = []
+
     for set_data in all_sets:
-        subject_tag = "_".join(set_data["subjects"])
+        subjects = set_data["subjects"]
+        subject_tag = f"{subjects[0]}-{subjects[-1]}" if subjects else "unknown"
         set_output_dir = os.path.join(OUTPUT_ROOT, f"{set_data['set_id']}_{TARGET_EYE_SIDE}_{subject_tag}")
         print(f"[run] processing {set_data['set_id']} -> {set_output_dir}")
-        summary_df = save_set_outputs(set_data, set_output_dir, THRESHOLD, TARGET_EYE_SIDE, matcher)
+        summary_df, multi_score_df = save_set_outputs(set_data, set_output_dir, THRESHOLD, TARGET_EYE_SIDE, matcher)
         all_summaries.append(summary_df)
+        all_multi_score_dfs.append(multi_score_df)
 
     all_sets_summary_df = pd.concat(all_summaries, ignore_index=True)
     save_dataframe(all_sets_summary_df, os.path.join(OUTPUT_ROOT, "all_sets_summary.csv"))
@@ -741,7 +848,6 @@ def main() -> None:
     aggregate_df = all_sets_summary_df[numeric_cols].agg(["mean", "std", "min", "max"])
     save_dataframe(aggregate_df.reset_index().rename(columns={"index": "stat"}), os.path.join(OUTPUT_ROOT, "aggregate_summary.csv"))
 
-    print()
     print("=== DONE ===")
     print(f"Completed sets: {len(all_sets_summary_df)}")
     print(f"Saved all-set summary to: {os.path.join(OUTPUT_ROOT, 'all_sets_summary.csv')}")

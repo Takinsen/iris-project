@@ -1,15 +1,27 @@
 import os
 import glob
-import time
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from sklearn.metrics import roc_curve, auc
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, balanced_accuracy_score,
+)
+try:
+    from xgboost import XGBClassifier
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBClassifier = None
+    XGBOOST_AVAILABLE = False
 
 OUTPUT_ROOT = r".\out_CASIA_Iris_Thousand_MultiSet_L"
 VIZ_DIR = os.path.join(OUTPUT_ROOT, "visualizations")
+
+FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson", "tanimoto"]
 
 
 def ensure_dir(path: str) -> None:
@@ -23,7 +35,6 @@ def ensure_dir(path: str) -> None:
 def load_all_sets_summary() -> pd.DataFrame:
     path = os.path.join(OUTPUT_ROOT, "all_sets_summary.csv")
     df = pd.read_csv(path)
-    # Drop incomplete/test rows that have no pairs
     return df[df["total_unique_pairs"] > 0].reset_index(drop=True)
 
 
@@ -35,6 +46,78 @@ def load_all_pair_records() -> pd.DataFrame:
         if len(df) > 0:
             frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def load_all_multi_score_features() -> list:
+    """Return a list of per-set DataFrames from multi_score_features.csv files."""
+    pattern = os.path.join(OUTPUT_ROOT, "**", "multi_score_features.csv")
+    frames = []
+    for fpath in sorted(glob.glob(pattern, recursive=True)):
+        df = pd.read_csv(fpath)
+        if len(df) > 0:
+            frames.append(df)
+    return frames
+
+
+# ------------------------------------------------------------------
+# Score-Level Fusion evaluation (leave-one-set-out)
+# ------------------------------------------------------------------
+
+def _eval_model(model, X_test: np.ndarray, y_test: np.ndarray) -> dict:
+    y_pred = model.predict(X_test)
+    return {
+        "accuracy":          float(accuracy_score(y_test, y_pred)),
+        "precision":         float(precision_score(y_test, y_pred, zero_division=0)),
+        "recall":            float(recall_score(y_test, y_pred, zero_division=0)),
+        "f1":                float(f1_score(y_test, y_pred, zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+    }
+
+
+def run_fusion_evaluation(per_set_dfs: list) -> dict:
+    """Leave-one-set-out CV → averaged metrics per model."""
+    n = len(per_set_dfs)
+    metric_keys = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
+    dt_results, xgb_results = [], []
+
+    for test_idx in range(n):
+        print(f"  [fusion] fold {test_idx + 1}/{n} ...", end="\r", flush=True)
+        train_df = pd.concat(
+            [df for i, df in enumerate(per_set_dfs) if i != test_idx],
+            ignore_index=True,
+        ).dropna(subset=FEATURE_COLS)
+        test_df = per_set_dfs[test_idx].dropna(subset=FEATURE_COLS)
+
+        X_train = train_df[FEATURE_COLS].values
+        y_train = train_df["true_label"].values
+        X_test  = test_df[FEATURE_COLS].values
+        y_test  = test_df["true_label"].values
+
+        neg = int((y_train == 0).sum())
+        pos = int((y_train == 1).sum())
+
+        dt = DecisionTreeClassifier(max_depth=5, class_weight="balanced", random_state=42)
+        dt.fit(X_train, y_train)
+        dt_results.append(_eval_model(dt, X_test, y_test))
+
+        if XGBOOST_AVAILABLE:
+            spw = neg / pos if pos > 0 else 1.0
+            xgb = XGBClassifier(
+                n_estimators=100, max_depth=4, scale_pos_weight=spw,
+                random_state=42, eval_metric="logloss", verbosity=0,
+            )
+            xgb.fit(X_train, y_train)
+            xgb_results.append(_eval_model(xgb, X_test, y_test))
+
+    print()
+
+    def _avg(results):
+        return {k: float(np.mean([r[k] for r in results])) for k in metric_keys}
+
+    out = {"Decision Tree": _avg(dt_results)}
+    if XGBOOST_AVAILABLE and xgb_results:
+        out["XGBoost"] = _avg(xgb_results)
+    return out
 
 
 # ------------------------------------------------------------------
@@ -75,8 +158,7 @@ def plot_distance_distributions(pairs: pd.DataFrame) -> None:
     genuine = pairs[pairs["pair_type"] == "genuine"]["distance"].dropna()
     impostor = pairs[pairs["pair_type"] == "impostor"]["distance"].dropna()
 
-    threshold = pairs["distance"].quantile(0.0)  # just for axis; we'll read from summary if needed
-    # Infer threshold from pred_label boundary
+    threshold = pairs["distance"].min()
     if "pred_label" in pairs.columns:
         matched = pairs[pairs["pred_label"] == 1]["distance"]
         unmatched = pairs[pairs["pred_label"] == 0]["distance"]
@@ -106,7 +188,6 @@ def plot_distance_distributions(pairs: pd.DataFrame) -> None:
 
 def plot_roc_curve(pairs: pd.DataFrame) -> None:
     y_true = pairs["true_label"].values
-    # Lower distance = more similar, so negate for sklearn (which expects higher score = more positive)
     scores = -pairs["distance"].values
 
     fpr, tpr, _ = roc_curve(y_true, scores)
@@ -149,8 +230,6 @@ def plot_det_curve(pairs: pd.DataFrame) -> None:
 
     far_arr = np.array(far_list)
     frr_arr = np.array(frr_list)
-
-    # EER: where FAR ≈ FRR
     eer_idx = np.argmin(np.abs(far_arr - frr_arr))
     eer = (far_arr[eer_idx] + frr_arr[eer_idx]) / 2
 
@@ -170,7 +249,7 @@ def plot_det_curve(pairs: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------
-# Plot 5 — Genuine / impostor distance box plots per set
+# Plot 5 — Genuine / impostor distance per set
 # ------------------------------------------------------------------
 
 def plot_distance_boxplots(summary: pd.DataFrame) -> None:
@@ -211,8 +290,8 @@ def plot_distance_boxplots(summary: pd.DataFrame) -> None:
 
 def compute_far_frr(summary: pd.DataFrame) -> pd.DataFrame:
     df = summary.copy()
-    df["far"] = df["FP"] / (df["FP"] + df["TN"])   # FP / total impostor
-    df["frr"] = df["FN"] / (df["FN"] + df["TP"])   # FN / total genuine
+    df["far"] = df["FP"] / (df["FP"] + df["TN"])
+    df["frr"] = df["FN"] / (df["FN"] + df["TP"])
     return df
 
 
@@ -253,16 +332,13 @@ def plot_aggregate_confusion_matrix(summary: pd.DataFrame) -> None:
     tn = int(summary["TN"].sum())
 
     values = np.array([[tp, fn], [fp, tn]])
-    row_labels = ["Actual Match", "Actual Non-Match"]
-    col_labels = ["Predicted Match", "Predicted Non-Match"]
-
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(values, cmap="Blues")
     fig.colorbar(im, ax=ax)
     ax.set_xticks([0, 1])
     ax.set_yticks([0, 1])
-    ax.set_xticklabels(col_labels)
-    ax.set_yticklabels(row_labels)
+    ax.set_xticklabels(["Predicted Match", "Predicted Non-Match"])
+    ax.set_yticklabels(["Actual Match", "Actual Non-Match"])
     ax.set_xlabel("Predicted Label")
     ax.set_ylabel("Actual Label")
     ax.set_title(f"Aggregate Confusion Matrix ({len(summary)} sets)")
@@ -280,7 +356,7 @@ def plot_aggregate_confusion_matrix(summary: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------
-# Plot 8 — Summary dashboard (all key stats in one figure)
+# Plot 8 — Summary dashboard
 # ------------------------------------------------------------------
 
 def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
@@ -291,7 +367,6 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
     sets = summary["set_id"].tolist()
     x = np.arange(len(sets))
 
-    # --- top-left: F1 / balanced accuracy per set ---
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.plot(x, summary["f1"].fillna(0), marker="o", color="#4C72B0", label="F1")
     ax1.plot(x, summary["balanced_accuracy"].fillna(0), marker="s", color="#DD8452", label="Bal. Acc.")
@@ -302,7 +377,6 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
     ax1.legend(fontsize=7)
     ax1.grid(True, linestyle="--", alpha=0.4)
 
-    # --- top-center: distance distribution ---
     ax2 = fig.add_subplot(gs[0, 1])
     genuine = pairs[pairs["pair_type"] == "genuine"]["distance"].dropna()
     impostor = pairs[pairs["pair_type"] == "impostor"]["distance"].dropna()
@@ -315,7 +389,6 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
     ax2.legend(fontsize=7)
     ax2.grid(True, linestyle="--", alpha=0.4)
 
-    # --- top-right: ROC ---
     ax3 = fig.add_subplot(gs[0, 2])
     scores = -pairs["distance"].values
     fpr, tpr, _ = roc_curve(pairs["true_label"].values, scores)
@@ -328,7 +401,6 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
     ax3.legend(fontsize=7)
     ax3.grid(True, linestyle="--", alpha=0.4)
 
-    # --- bottom-left: mean genuine / impostor per set ---
     ax4 = fig.add_subplot(gs[1, 0])
     ax4.errorbar(x, summary["mean_genuine_distance"], yerr=summary["std_genuine_distance"],
                  fmt="o-", color="#4C72B0", capsize=3, markersize=4, label="Genuine")
@@ -341,7 +413,6 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
     ax4.legend(fontsize=7)
     ax4.grid(True, linestyle="--", alpha=0.4)
 
-    # --- bottom-center: aggregate confusion matrix ---
     ax5 = fig.add_subplot(gs[1, 1])
     tp = int(summary["TP"].sum())
     fp = int(summary["FP"].sum())
@@ -360,28 +431,22 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
                      color="white" if vals[i, j] > thresh_cm else "black", fontsize=10, fontweight="bold")
     ax5.set_title("Aggregate Confusion Matrix", fontsize=9)
 
-    # --- bottom-right: aggregate metric summary table (includes FAR/FRR) ---
     df_far_frr = compute_far_frr(summary)
     ax6 = fig.add_subplot(gs[1, 2])
     ax6.axis("off")
-    metric_cols = ["accuracy", "f1", "balanced_accuracy", "far", "frr"]
+    metric_cols   = ["accuracy", "f1", "balanced_accuracy", "far", "frr"]
     metric_labels = ["Accuracy", "F1", "Bal. Acc.", "FAR", "FRR"]
     table_data = []
     for col, label in zip(metric_cols, metric_labels):
         vals_col = df_far_frr[col].dropna()
-        table_data.append([
-            label,
-            f"{vals_col.mean():.4f}",
-            f"{vals_col.std():.4f}",
-            f"{vals_col.min():.4f}",
-            f"{vals_col.max():.4f}",
-        ])
-    tbl = ax6.table(
-        cellText=table_data,
-        colLabels=["Metric", "Mean", "Std", "Min", "Max"],
-        loc="center",
-        cellLoc="center",
-    )
+        table_data.append([label,
+                            f"{vals_col.mean():.4f}",
+                            f"{vals_col.std():.4f}",
+                            f"{vals_col.min():.4f}",
+                            f"{vals_col.max():.4f}"])
+    tbl = ax6.table(cellText=table_data,
+                    colLabels=["Metric", "Mean", "Std", "Min", "Max"],
+                    loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(7)
     tbl.scale(1, 1.4)
@@ -393,84 +458,48 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame) -> None:
 
 
 # ------------------------------------------------------------------
-# Plot 9 — Matching latency (pairs/sec throughput per set)
+# Plot 9 — Score-Level Fusion vs Baseline comparison
 # ------------------------------------------------------------------
 
-def measure_and_plot_latency(summary: pd.DataFrame) -> None:
-    """
-    Estimates matching throughput by timing how long it takes to re-read and
-    process each set's pair_records.csv.  Reports pairs/sec as a proxy for
-    the evaluation phase latency.  True template-generation latency requires
-    instrumentation inside baseline_casia_thousand_multiset.py.
-    """
-    set_ids, pairs_per_sec, load_times_ms = [], [], []
+def plot_comparison_report(summary: pd.DataFrame, fusion_results: dict) -> None:
+    metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
+    metric_labels = ["Accuracy", "Precision", "Recall", "F1", "Bal. Accuracy"]
 
-    pattern = os.path.join(OUTPUT_ROOT, "**", "pair_records.csv")
-    for fpath in sorted(glob.glob(pattern, recursive=True)):
-        t0 = time.perf_counter()
-        df = pd.read_csv(fpath)
-        if len(df) == 0:
-            continue
-        _ = (df["distance"] <= df["distance"].median()).sum()   # simulate threshold scan
-        elapsed = time.perf_counter() - t0
+    baseline_avg = {k: float(summary[k].mean()) for k in metric_keys}
 
-        set_id = df["set_id"].iloc[0]
-        n_pairs = len(df)
-        set_ids.append(set_id)
-        pairs_per_sec.append(n_pairs / elapsed)
-        load_times_ms.append(elapsed * 1000)
+    approach_names  = ["Baseline\n(Hamming 0.38)"] + [f"Fusion\n{n}" for n in fusion_results]
+    approach_values = [baseline_avg] + list(fusion_results.values())
+    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"][:len(approach_names)]
 
-    if not set_ids:
-        return
+    n_metrics    = len(metric_keys)
+    n_approaches = len(approach_names)
+    x     = np.arange(n_metrics)
+    width = 0.75 / n_approaches
 
-    x = np.arange(len(set_ids))
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle("Evaluation Latency (pair-record load + threshold scan)", fontsize=11)
+    fig, ax = plt.subplots(figsize=(13, 6))
 
-    # Left: pairs per second
-    ax1.bar(x, pairs_per_sec, color="#4C72B0")
-    ax1.axhline(np.mean(pairs_per_sec), color="crimson", linestyle="--",
-                linewidth=1.2, label=f"Mean: {np.mean(pairs_per_sec):,.0f} pairs/s")
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(set_ids, rotation=45, ha="right", fontsize=7)
-    ax1.set_ylabel("Pairs per Second")
-    ax1.set_title("Throughput per Set")
-    ax1.legend(fontsize=8)
-    ax1.yaxis.grid(True, linestyle="--", alpha=0.4)
-    ax1.set_axisbelow(True)
+    for i, (name, metrics, color) in enumerate(zip(approach_names, approach_values, colors)):
+        offsets = x + (i - n_approaches / 2 + 0.5) * width
+        vals = [metrics[k] for k in metric_keys]
+        bars = ax.bar(offsets, vals, width, label=name, color=color, alpha=0.85)
+        for bar, val in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.0015,
+                    f"{val:.4f}",
+                    ha="center", va="bottom", fontsize=6.5, rotation=90)
 
-    # Right: wall-clock ms per set
-    ax2.bar(x, load_times_ms, color="#55A868")
-    ax2.axhline(np.mean(load_times_ms), color="crimson", linestyle="--",
-                linewidth=1.2, label=f"Mean: {np.mean(load_times_ms):.1f} ms/set")
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(set_ids, rotation=45, ha="right", fontsize=7)
-    ax2.set_ylabel("Time (ms)")
-    ax2.set_title("Evaluation Time per Set")
-    ax2.legend(fontsize=8)
-    ax2.yaxis.grid(True, linestyle="--", alpha=0.4)
-    ax2.set_axisbelow(True)
-
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels, fontsize=11)
+    ax.set_ylim(0, 1.15)
+    ax.set_ylabel("Score")
+    ax.set_title("Score-Level Fusion vs Baseline  (Leave-One-Set-Out CV)", fontsize=12)
+    ax.legend(fontsize=9, loc="lower right")
+    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
+    ax.set_axisbelow(True)
     fig.tight_layout()
-    fig.savefig(os.path.join(VIZ_DIR, "latency_per_set.png"), dpi=150, bbox_inches="tight")
+    fig.savefig(os.path.join(VIZ_DIR, "comparison_report.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("  saved: latency_per_set.png")
-
-    latency_df = pd.DataFrame({
-        "set_id": set_ids,
-        "n_pairs": [int(summary.loc[summary["set_id"] == s, "total_unique_pairs"].iloc[0])
-                    if s in summary["set_id"].values else None for s in set_ids],
-        "eval_time_ms": [round(t, 3) for t in load_times_ms],
-        "pairs_per_sec": [round(p, 1) for p in pairs_per_sec],
-        "us_per_pair": [round(t * 1000 / p * 1000, 3) for t, p in zip(load_times_ms, pairs_per_sec)],
-    })
-    latency_df.to_csv(os.path.join(VIZ_DIR, "latency_summary.csv"), index=False)
-    print("  saved: latency_summary.csv")
-
-    total_pairs = latency_df["n_pairs"].sum()
-    total_ms = latency_df["eval_time_ms"].sum()
-    print(f"  total: {total_pairs:,} pairs in {total_ms:.1f} ms "
-          f"({total_pairs / (total_ms / 1000):,.0f} pairs/s overall)")
+    print("  saved: comparison_report.png")
 
 
 # ------------------------------------------------------------------
@@ -482,9 +511,10 @@ def main() -> None:
     print(f"Loading data from: {OUTPUT_ROOT}")
 
     summary = load_all_sets_summary()
-    pairs = load_all_pair_records()
+    pairs   = load_all_pair_records()
+    per_set_multi = load_all_multi_score_features()
 
-    print(f"  {len(summary)} sets | {len(pairs):,} pair records")
+    print(f"  {len(summary)} sets | {len(pairs):,} pair records | {len(per_set_multi)} multi-score sets")
     print(f"Saving plots to: {VIZ_DIR}")
 
     plot_metrics_per_set(summary)
@@ -495,7 +525,14 @@ def main() -> None:
     plot_far_frr_per_set(summary)
     plot_aggregate_confusion_matrix(summary)
     plot_dashboard(summary, pairs)
-    measure_and_plot_latency(summary)
+
+    if per_set_multi:
+        if not XGBOOST_AVAILABLE:
+            print("  [warning] xgboost not installed — only Decision Tree will run.")
+        fusion_results = run_fusion_evaluation(per_set_multi)
+        plot_comparison_report(summary, fusion_results)
+    else:
+        print("  [skip] no multi_score_features.csv found — re-run baseline script first.")
 
     print("\nDone.")
 
