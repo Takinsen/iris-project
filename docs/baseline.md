@@ -411,10 +411,11 @@ save_confusion_matrix_plot(confusion_df, ".../confusion_matrix.png")
 | `skipped_subjects.csv` | Subjects excluded due to insufficient valid images |
 | `set_manifest.csv` | Subject list and set configuration |
 | `distance_matrix.csv` | N×N pairwise Hamming distance matrix |
-| `pair_records.csv` | One row per pair: distance, pair type, true/predicted labels |
+| `pair_records.csv` | One row per pair: distance, pair type, true/predicted labels — **read by `evaluate.py` for LOSO baseline** |
 | `comparison_summary.csv` | TP, FP, FN, TN and all metrics |
 | `confusion_matrix.csv` | 2×2 confusion matrix table |
 | `confusion_matrix.png` | Confusion matrix heatmap |
+| `multi_score_features.csv` | One row per pair: hamming + jaccard + cosine + pearson features + true_label — **read by `evaluate.py` for score-level fusion** |
 
 ---
 
@@ -454,20 +455,29 @@ save_dataframe(aggregate_df.reset_index(), os.path.join(OUTPUT_ROOT, "aggregate_
     skipped_subjects.csv
     set_manifest.csv
     distance_matrix.csv
-    pair_records.csv
+    pair_records.csv            ← read by evaluate.py (LOSO baseline)
     comparison_summary.csv
     confusion_matrix.csv
     confusion_matrix.png
+    multi_score_features.csv    ← read by evaluate.py (fusion models)
   set_02_L_<subjects>/
     ...
-  visualizations/               — produced by evaluate.py
-    metrics_per_set.png
-    distance_distribution.png
-    roc_curve.png
-    det_curve.png
-    distance_per_set.png
-    aggregate_confusion_matrix.png
-    dashboard.png
+  visualizations/               — produced by evaluate.py (see improvement.md)
+    baseline/
+      metrics_per_set.png
+      distance_distribution.png
+      roc_curve.png
+      det_curve.png
+      distance_per_set.png
+      loso_threshold_per_set.png
+      far_frr_per_set.png
+      aggregate_confusion_matrix.png
+      dashboard.png
+    random_forest/
+    logistic_regression/
+    gaussian_naive_bayes/
+    linear_discriminant_analysis/
+    comparison_report.png
 ```
 
 ---
