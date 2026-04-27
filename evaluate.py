@@ -11,6 +11,50 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# ------------------------------------------------------------------
+# Baseline classifier — sklearn-compatible wrapper
+# ------------------------------------------------------------------
+
+class HammingThresholdClassifier:
+    """
+    Treats the first FEATURE_COL (hamming) as the sole decision variable.
+    fit()  → sweep thresholds on training pairs to maximise balanced accuracy.
+    predict_proba() → score = 1 - hamming (higher = more likely genuine).
+    feature_importances_ → [1, 0, 0, …] so it works with plot_feature_importance.
+    """
+
+    def __init__(self, n_steps: int = 500):
+        self.n_steps    = n_steps
+        self.threshold_ = 0.38  # sensible default before fit
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "HammingThresholdClassifier":
+        distances = X[:, 0]
+        thresholds = np.linspace(distances.min(), distances.max(), self.n_steps)
+        best_thr, best_score = float(thresholds[0]), -1.0
+        for thr in thresholds:
+            score = float(balanced_accuracy_score(y, (distances <= thr).astype(int)))
+            if score > best_score:
+                best_score, best_thr = score, float(thr)
+        self.threshold_ = best_thr
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return (X[:, 0] <= self.threshold_).astype(int)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        pos = np.clip(1.0 - X[:, 0], 0.0, 1.0)
+        return np.column_stack([1.0 - pos, pos])
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        imp    = np.zeros(len(FEATURE_COLS))
+        imp[0] = 1.0  # only 'hamming' matters
+        return imp
+
 
 # ------------------------------------------------------------------
 # Output paths
@@ -25,6 +69,7 @@ LDA_DIR      = os.path.join(VIZ_DIR, "linear_discriminant_analysis")
 
 FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson"]
 MODEL_DIRS   = {
+    "Baseline (Hamming)":           BASELINE_DIR,
     "Random Forest":                RF_DIR,
     "Logistic Regression":          LR_DIR,
     "Gaussian Naive Bayes":         GNB_DIR,
@@ -32,38 +77,99 @@ MODEL_DIRS   = {
 }
 
 # ------------------------------------------------------------------
+# Optuna search-space definitions  (one callable per model)
+# Each receives an optuna.Trial and returns a dict of params to override.
+# ------------------------------------------------------------------
+
+def _rf_space(trial):
+    return {
+        "n_estimators":      trial.suggest_int("n_estimators", 50, 500),
+        "max_depth":         trial.suggest_categorical("max_depth", [None, 5, 10, 20, 30]),
+        "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+        "min_samples_leaf":  trial.suggest_int("min_samples_leaf", 1, 10),
+    }
+
+
+def _lr_space(trial):
+    return {
+        "C": trial.suggest_float("C", 1e-4, 1e2, log=True),
+    }
+
+
+def _gnb_space(trial):
+    return {
+        "var_smoothing": trial.suggest_float("var_smoothing", 1e-12, 1e-1, log=True),
+    }
+
+
+def _lda_space(trial):
+    solver = trial.suggest_categorical("solver", ["svd", "lsqr"])
+    result = {"solver": solver}
+    if solver != "svd":
+        result["shrinkage"] = trial.suggest_categorical(
+            "shrinkage", [None, "auto", 0.1, 0.3, 0.5]
+        )
+    return result
+
+
+# ------------------------------------------------------------------
 # Model Configuration
 # Toggle `enabled` to include/exclude a model.
-# Edit `params` to change hyperparameters without touching training code.
+# Set `hp_tuning: True` to run Optuna search on each LOSO training fold.
 # ------------------------------------------------------------------
 MODELS_CONFIG = {
+    "Baseline (Hamming)": {
+        "enabled":        True,
+        "hp_tuning":      False,   # self-tunes via threshold sweep in fit()
+        "params":         {"n_steps": 1000},
+        "param_space":    None,
+        "n_trials":       0,
+        "study_n_jobs":   1,
+        "tune_subsample": None,
+    },
     "Random Forest": {
-        "enabled": True,
+        "enabled":        True,
+        "hp_tuning":      True,
         "params": {
-            "n_estimators": 200,
             "class_weight": "balanced",
             "random_state": 42,
             "n_jobs":       -1,
         },
+        "param_space":    _rf_space,
+        "n_trials":       25,
+        "study_n_jobs":   1,        # RF uses n_jobs=-1 internally; don't nest
+        "tune_subsample": 50_000,   # cap rows fed to Optuna; final fit uses all
     },
     "Logistic Regression": {
-        "enabled": True,
+        "enabled":        True,
+        "hp_tuning":      True,
         "params": {
-            "C":            1.0,
             "class_weight": "balanced",
-            "max_iter":     1000,
+            "max_iter":     2000,
             "random_state": 42,
         },
+        "param_space":    _lr_space,
+        "n_trials":       20,
+        "study_n_jobs":   4,        # 4 parallel trials; LR has no internal n_jobs
+        "tune_subsample": None,
     },
     "Gaussian Naive Bayes": {
-        "enabled": True,
-        "params": {},
+        "enabled":        True,
+        "hp_tuning":      True,
+        "params":         {},
+        "param_space":    _gnb_space,
+        "n_trials":       15,
+        "study_n_jobs":   4,
+        "tune_subsample": None,
     },
     "Linear Discriminant Analysis": {
-        "enabled": True,
-        "params": {
-            "solver": "svd",
-        },
+        "enabled":        True,
+        "hp_tuning":      True,
+        "params":         {"solver": "svd"},
+        "param_space":    _lda_space,
+        "n_trials":       10,       # only 6 valid solver/shrinkage combos exist
+        "study_n_jobs":   4,
+        "tune_subsample": None,
     },
 }
 
@@ -72,36 +178,88 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def _instantiate_model(name: str):
-    params = MODELS_CONFIG[name]["params"]
-    constructors = {
-        "Random Forest":                RandomForestClassifier,
-        "Logistic Regression":          LogisticRegression,
-        "Gaussian Naive Bayes":         GaussianNB,
-        "Linear Discriminant Analysis": LinearDiscriminantAnalysis,
-    }
-    return constructors[name](**params)
+_CONSTRUCTORS = {
+    "Baseline (Hamming)":           HammingThresholdClassifier,
+    "Random Forest":                RandomForestClassifier,
+    "Logistic Regression":          LogisticRegression,
+    "Gaussian Naive Bayes":         GaussianNB,
+    "Linear Discriminant Analysis": LinearDiscriminantAnalysis,
+}
+
+
+def _instantiate_model(name: str, extra_params: dict = None):
+    params = {**MODELS_CONFIG[name]["params"], **(extra_params or {})}
+    return _CONSTRUCTORS[name](**params)
+
+
+def _tune_model(name: str, X_tr: np.ndarray, y_tr: np.ndarray):
+    """
+    Fit a model for `name` on (X_tr, y_tr).
+    If hp_tuning=True and param_space is provided, runs an Optuna TPE study.
+    Speed knobs (all from MODELS_CONFIG):
+      n_trials       — Optuna iterations
+      study_n_jobs   — parallel Optuna trials (thread-based; safe when model
+                       has no internal n_jobs); set to 1 for RF which uses
+                       n_jobs=-1 internally to avoid CPU over-subscription
+      tune_subsample — max rows passed to the Optuna objective; the final
+                       model is always refit on the full training slice
+    cv_jobs is derived automatically: -1 (parallel CV folds) when both the
+    model and the study are single-threaded; 1 otherwise.
+    Returns (fitted_model, best_trial_params_or_None).
+    """
+    cfg         = MODELS_CONFIG[name]
+    param_space = cfg.get("param_space")
+    if not cfg.get("hp_tuning", False) or param_space is None:
+        model = _instantiate_model(name)
+        model.fit(X_tr, y_tr)
+        return model, None
+
+    n_trials   = cfg.get("n_trials", 30)
+    study_jobs = cfg.get("study_n_jobs", 1)
+    subsample  = cfg.get("tune_subsample")
+
+    # Parallel CV folds only when neither the model nor the study already
+    # introduces its own parallelism (avoids CPU over-subscription).
+    model_is_parallel = "n_jobs" in cfg["params"]
+    cv_jobs = 1 if (model_is_parallel or study_jobs != 1) else -1
+    cv      = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+    # Subsample training data for the Optuna search only
+    if subsample and len(X_tr) > subsample:
+        rng        = np.random.default_rng(42)
+        idx        = rng.choice(len(X_tr), size=subsample, replace=False)
+        X_opt, y_opt = X_tr[idx], y_tr[idx]
+    else:
+        X_opt, y_opt = X_tr, y_tr
+
+    def objective(trial):
+        scores = cross_val_score(
+            _instantiate_model(name, param_space(trial)),
+            X_opt, y_opt,
+            cv=cv, scoring="balanced_accuracy", n_jobs=cv_jobs,
+        )
+        return float(scores.mean())
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+    )
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        n_jobs=study_jobs,
+        show_progress_bar=False,
+    )
+
+    best_trial_params = study.best_params
+    best_model = _instantiate_model(name, best_trial_params)
+    best_model.fit(X_tr, y_tr)   # always refit on full training slice
+    return best_model, best_trial_params
 
 
 # ------------------------------------------------------------------
 # Data loading
 # ------------------------------------------------------------------
-
-def load_per_set_pair_records() -> list:
-    """Return a list of DataFrames, one per set, sorted by set folder name."""
-    frames = []
-    for fpath in sorted(glob.glob(os.path.join(OUTPUT_ROOT, "**", "pair_records.csv"), recursive=True)):
-        df = pd.read_csv(fpath)
-        if len(df) == 0:
-            continue
-        if "set_id" not in df.columns:
-            set_id = os.path.basename(os.path.dirname(fpath))
-            df["set_id"] = set_id
-        if "pair_type" not in df.columns and "true_label" in df.columns:
-            df["pair_type"] = df["true_label"].map({1: "genuine", 0: "impostor"})
-        frames.append(df)
-    return frames
-
 
 def load_all_multi_score_features() -> list:
     frames = []
@@ -113,136 +271,54 @@ def load_all_multi_score_features() -> list:
 
 
 # ------------------------------------------------------------------
-# Baseline — LOSO with optimised threshold
-# ------------------------------------------------------------------
-
-def _find_best_threshold(distances: np.ndarray, y_true: np.ndarray,
-                         n_steps: int = 500) -> float:
-    """Sweep thresholds on training data; return the one that maximises balanced accuracy."""
-    thresholds = np.linspace(distances.min(), distances.max(), n_steps)
-    best_thr, best_score = thresholds[0], -1.0
-    for thr in thresholds:
-        pred  = (distances <= thr).astype(int)
-        score = float(balanced_accuracy_score(y_true, pred))
-        if score > best_score:
-            best_score, best_thr = score, thr
-    return float(best_thr)
-
-
-def run_baseline_loso_evaluation(per_set_pair_records: list) -> dict:
-    """
-    Leave-one-set-out cross-validation for the Hamming distance baseline.
-    For each fold:
-      - Concatenate n-1 sets → find the Hamming threshold that maximises
-        balanced accuracy on those pairs.
-      - Apply that threshold to the held-out set and record metrics.
-    Returns:
-      summary  — DataFrame with one row per fold (metrics, TP/FP/FN/TN, threshold)
-      pairs    — DataFrame of all held-out pairs (for ROC / DET curves)
-    """
-    n = len(per_set_pair_records)
-    rows          = []
-    all_distances = []
-    all_y_true    = []
-    all_y_pred    = []
-    all_pair_type = []
-
-    for test_idx in range(n):
-        print(f"  [baseline LOSO] fold {test_idx + 1}/{n} ...", end="\r", flush=True)
-
-        train_df = pd.concat(
-            [df for i, df in enumerate(per_set_pair_records) if i != test_idx],
-            ignore_index=True,
-        ).dropna(subset=["distance", "true_label"])
-        test_df = per_set_pair_records[test_idx].dropna(subset=["distance", "true_label"])
-
-        best_thr = _find_best_threshold(train_df["distance"].values,
-                                        train_df["true_label"].values)
-
-        d_te   = test_df["distance"].values
-        y_te   = test_df["true_label"].values
-        pred   = (d_te <= best_thr).astype(int)
-
-        tp = int(((y_te == 1) & (pred == 1)).sum())
-        fp = int(((y_te == 0) & (pred == 1)).sum())
-        fn = int(((y_te == 1) & (pred == 0)).sum())
-        tn = int(((y_te == 0) & (pred == 0)).sum())
-
-        gen_d = test_df[test_df["pair_type"] == "genuine"]["distance"].dropna()
-        imp_d = test_df[test_df["pair_type"] == "impostor"]["distance"].dropna()
-        set_id = test_df["set_id"].iloc[0] if "set_id" in test_df.columns else f"set_{test_idx + 1:02d}"
-
-        rows.append({
-            "set_id":                 set_id,
-            "threshold":              best_thr,
-            "accuracy":               float(accuracy_score(y_te, pred)),
-            "precision":              float(precision_score(y_te, pred, zero_division=0)),
-            "recall":                 float(recall_score(y_te, pred, zero_division=0)),
-            "f1":                     float(f1_score(y_te, pred, zero_division=0)),
-            "balanced_accuracy":      float(balanced_accuracy_score(y_te, pred)),
-            "TP": tp, "FP": fp, "FN": fn, "TN": tn,
-            "mean_genuine_distance":  float(gen_d.mean()) if len(gen_d) else np.nan,
-            "std_genuine_distance":   float(gen_d.std())  if len(gen_d) else np.nan,
-            "mean_impostor_distance": float(imp_d.mean()) if len(imp_d) else np.nan,
-            "std_impostor_distance":  float(imp_d.std())  if len(imp_d) else np.nan,
-            "total_unique_pairs":     len(test_df),
-        })
-
-        all_distances.extend(d_te.tolist())
-        all_y_true.extend(y_te.tolist())
-        all_y_pred.extend(pred.tolist())
-        all_pair_type.extend(test_df["pair_type"].tolist() if "pair_type" in test_df.columns
-                             else (["genuine" if v == 1 else "impostor" for v in y_te]))
-
-    print()
-
-    summary = pd.DataFrame(rows)
-    pairs   = pd.DataFrame({
-        "distance":   all_distances,
-        "true_label": all_y_true,
-        "pred_label": all_y_pred,
-        "pair_type":  all_pair_type,
-    })
-
-    metric_keys = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
-    avg_metrics = {k: float(summary[k].mean()) for k in metric_keys}
-
-    return {"summary": summary, "pairs": pairs, "avg_metrics": avg_metrics}
-
-
-# ------------------------------------------------------------------
-# Score-Level Fusion — LOSO (unchanged logic, model-driven)
+# Unified LOSO evaluation — Baseline + all fusion models in one loop
 # ------------------------------------------------------------------
 
 def _eval(model, X: np.ndarray, y: np.ndarray) -> dict:
     yp = model.predict(X)
+    tp = int(((y == 1) & (yp == 1)).sum())
+    fp = int(((y == 0) & (yp == 1)).sum())
+    fn = int(((y == 1) & (yp == 0)).sum())
+    tn = int(((y == 0) & (yp == 0)).sum())
     return {
         "accuracy":          float(accuracy_score(y, yp)),
         "precision":         float(precision_score(y, yp, zero_division=0)),
         "recall":            float(recall_score(y, yp, zero_division=0)),
         "f1":                float(f1_score(y, yp, zero_division=0)),
         "balanced_accuracy": float(balanced_accuracy_score(y, yp)),
+        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
     }
 
 
-def run_fusion_evaluation(per_set_dfs: list) -> dict:
+def run_loso_evaluation(per_set_dfs: list) -> dict:
     """
-    LOSO cross-validation for all enabled models in MODELS_CONFIG.
-    Returns a dict keyed by model name, each value containing:
-      avg_metrics, fold_metrics, set_ids, all_y_true, all_y_pred, all_y_score, final_model
+    Single LOSO loop over all models enabled in MODELS_CONFIG.
+    Baseline (Hamming) runs here too — its threshold is optimised on each
+    training fold, exactly like sklearn models are fitted.
+
+    Each bucket contains:
+      fold_metrics   — list of per-fold metric dicts (incl. TP/FP/FN/TN;
+                       Baseline also adds threshold + distance stats)
+      set_ids        — set_id string per fold
+      all_y_true / all_y_pred / all_y_score — concatenated LOSO predictions
+      all_distances  — raw hamming distances (used by baseline plots)
+      all_pair_types — "genuine"/"impostor" label per pair
+      final_model    — model re-fitted on ALL data (for feature importance)
+      avg_metrics    — LOSO-averaged metric dict
     """
-    n = len(per_set_dfs)
+    n             = len(per_set_dfs)
     metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
     enabled_names = [name for name, cfg in MODELS_CONFIG.items() if cfg["enabled"]]
 
     buckets: dict = {
         name: {"fold_metrics": [], "set_ids": [],
-               "all_y_true": [], "all_y_pred": [], "all_y_score": []}
+               "all_y_true": [], "all_y_pred": [], "all_y_score": [],
+               "all_distances": [], "all_pair_types": []}
         for name in enabled_names
     }
 
     for test_idx in range(n):
-        print(f"  [fusion] fold {test_idx + 1}/{n} ...", end="\r", flush=True)
+        print(f"  [LOSO] fold {test_idx + 1}/{n} ...", flush=True)
 
         train_df = pd.concat(
             [df for i, df in enumerate(per_set_dfs) if i != test_idx],
@@ -252,34 +328,55 @@ def run_fusion_evaluation(per_set_dfs: list) -> dict:
 
         X_tr, y_tr = train_df[FEATURE_COLS].values, train_df["true_label"].values
         X_te, y_te = test_df[FEATURE_COLS].values,  test_df["true_label"].values
-        set_id = test_df["set_id"].iloc[0] if "set_id" in test_df.columns else f"set_{test_idx + 1:02d}"
+        set_id     = test_df["set_id"].iloc[0] if "set_id" in test_df.columns else f"set_{test_idx + 1:02d}"
+        d_te       = test_df["hamming"].values
+        pt_te      = (test_df["pair_type"].tolist() if "pair_type" in test_df.columns
+                      else np.where(y_te == 1, "genuine", "impostor").tolist())
 
         for name in enabled_names:
-            model = _instantiate_model(name)
-            model.fit(X_tr, y_tr)
-            b = buckets[name]
-            b["fold_metrics"].append(_eval(model, X_te, y_te))
+            model, best_params = _tune_model(name, X_tr, y_tr)
+            if best_params:
+                print(f"    [{name}] best params: {best_params}", flush=True)
+            b       = buckets[name]
+            metrics = _eval(model, X_te, y_te)
+            metrics["set_id"] = set_id
+            if best_params:
+                metrics["best_params"] = str(best_params)
+
+            # Extra stats stored only for threshold-based models (Baseline)
+            if hasattr(model, "threshold_"):
+                metrics["threshold"] = float(model.threshold_)
+                gen_d = d_te[y_te == 1]
+                imp_d = d_te[y_te == 0]
+                metrics["mean_genuine_distance"]  = float(gen_d.mean()) if len(gen_d) else np.nan
+                metrics["std_genuine_distance"]   = float(gen_d.std())  if len(gen_d) else np.nan
+                metrics["mean_impostor_distance"] = float(imp_d.mean()) if len(imp_d) else np.nan
+                metrics["std_impostor_distance"]  = float(imp_d.std())  if len(imp_d) else np.nan
+
+            b["fold_metrics"].append(metrics)
             b["set_ids"].append(set_id)
             b["all_y_true"].extend(y_te.tolist())
             b["all_y_pred"].extend(model.predict(X_te).tolist())
             b["all_y_score"].extend(model.predict_proba(X_te)[:, 1].tolist())
+            b["all_distances"].extend(d_te.tolist())
+            b["all_pair_types"].extend(pt_te)
 
-    print()
-
-    # Final models trained on all data (for plots that need the fitted model)
+    # Final models trained on all data (feature importance / coefficient plots)
     all_df = pd.concat(per_set_dfs, ignore_index=True).dropna(subset=FEATURE_COLS)
     X_all, y_all = all_df[FEATURE_COLS].values, all_df["true_label"].values
-
+    print("  [LOSO] fitting final models on all data ...")
     for name in enabled_names:
-        final = _instantiate_model(name)
-        final.fit(X_all, y_all)
+        final, best_params = _tune_model(name, X_all, y_all)
+        if best_params:
+            print(f"    [{name}] final best params: {best_params}", flush=True)
         buckets[name]["final_model"] = final
 
     for b in buckets.values():
-        b["all_y_true"]  = np.array(b["all_y_true"])
-        b["all_y_pred"]  = np.array(b["all_y_pred"])
-        b["all_y_score"] = np.array(b["all_y_score"])
-        b["avg_metrics"] = {k: float(np.mean([m[k] for m in b["fold_metrics"]])) for k in metric_keys}
+        b["all_y_true"]    = np.array(b["all_y_true"])
+        b["all_y_pred"]    = np.array(b["all_y_pred"])
+        b["all_y_score"]   = np.array(b["all_y_score"])
+        b["all_distances"] = np.array(b["all_distances"])
+        b["avg_metrics"]   = {k: float(np.mean([m[k] for m in b["fold_metrics"]])) for k in metric_keys}
 
     return buckets
 
@@ -768,66 +865,82 @@ def plot_comparison_report(loso_summary: pd.DataFrame, fusion_results: dict, out
 
 def main() -> None:
     enabled_dirs = [MODEL_DIRS[name] for name, cfg in MODELS_CONFIG.items() if cfg["enabled"]]
-    for d in [VIZ_DIR, BASELINE_DIR] + enabled_dirs:
+    for d in [VIZ_DIR] + enabled_dirs:
         ensure_dir(d)
 
     print(f"Loading data from: {OUTPUT_ROOT}")
-    per_set_pairs = load_per_set_pair_records()
     per_set_multi = load_all_multi_score_features()
-    total_pairs   = sum(len(df) for df in per_set_pairs)
-    print(f"  {len(per_set_pairs)} sets | {total_pairs:,} pair records | {len(per_set_multi)} multi-score sets")
+    total_pairs   = sum(len(df) for df in per_set_multi)
+    print(f"  {len(per_set_multi)} sets | {total_pairs:,} pair records")
 
     print("\nEnabled models:")
     for name, cfg in MODELS_CONFIG.items():
         status = "ON " if cfg["enabled"] else "OFF"
-        print(f"  [{status}] {name}  params={cfg['params']}")
+        if cfg.get("hp_tuning") and cfg.get("param_space"):
+            sub = f" sub={cfg.get('tune_subsample','all')}" if cfg.get("tune_subsample") else ""
+            tune = f" [Optuna n={cfg.get('n_trials',0)} jobs={cfg.get('study_n_jobs',1)}{sub}]"
+        else:
+            tune = ""
+        print(f"  [{status}] {name}{tune}  params={cfg['params']}")
 
-    # ---- Baseline LOSO → visualizations/baseline/ ----
-    print("\n[baseline — LOSO cross-validation]")
-    baseline     = run_baseline_loso_evaluation(per_set_pairs)
-    loso_summary = baseline["summary"]
-    loso_pairs   = baseline["pairs"]
-
-    plot_metrics_per_set(loso_summary, BASELINE_DIR)
-    plot_distance_distributions(loso_pairs, BASELINE_DIR)
-    plot_roc_curve(loso_pairs, BASELINE_DIR)
-    plot_det_curve(loso_pairs, BASELINE_DIR)
-    plot_distance_per_set(loso_summary, BASELINE_DIR)
-    plot_loso_threshold_per_set(loso_summary, BASELINE_DIR)
-    plot_far_frr_per_set(loso_summary, BASELINE_DIR)
-    plot_aggregate_confusion_matrix(loso_summary, BASELINE_DIR, title_prefix="Baseline LOSO")
-    plot_dashboard(loso_summary, loso_pairs, BASELINE_DIR)
-
-    # ---- Fusion evaluation ----
     if not per_set_multi:
-        print("\n  [skip] no multi_score_features.csv found — re-run baseline script first.")
-    else:
-        print("\n[fusion evaluation]")
-        fusion_results = run_fusion_evaluation(per_set_multi)
+        print("\n  [skip] no multi_score_features.csv found — run baseline script first.")
+        return
 
-        for model_name, res in fusion_results.items():
-            out_dir = MODEL_DIRS.get(model_name, VIZ_DIR)
-            print(f"\n[{model_name}]")
-            plot_model_confusion_matrix(res["all_y_true"], res["all_y_pred"], model_name, out_dir)
-            plot_model_roc_curve(res["all_y_true"], res["all_y_score"], model_name, out_dir)
-            plot_model_metrics_per_set(res["fold_metrics"], res["set_ids"], model_name, out_dir)
-            final = res["final_model"]
-            if hasattr(final, "feature_importances_"):
-                plot_feature_importance(final, model_name, out_dir)
-            elif hasattr(final, "coef_"):
-                plot_model_coefficients(final, model_name, out_dir)
-            else:
-                print(f"  [{model_name}] skipped: no coefficient/importance attribute")
+    # ---- Single unified LOSO loop ----
+    print("\n[LOSO cross-validation — all enabled models]")
+    results = run_loso_evaluation(per_set_multi)
 
-        # ---- Comparison → visualizations/ (root) ----
+    # ---- Baseline plots → visualizations/baseline/ ----
+    baseline_name = "Baseline (Hamming)"
+    if baseline_name in results:
+        res          = results[baseline_name]
+        loso_summary = pd.DataFrame(res["fold_metrics"])
+        loso_pairs   = pd.DataFrame({
+            "distance":   res["all_distances"],
+            "true_label": res["all_y_true"],
+            "pred_label": res["all_y_pred"],
+            "pair_type":  res["all_pair_types"],
+        })
+        out_dir = MODEL_DIRS[baseline_name]
+        print(f"\n[{baseline_name}]")
+        plot_metrics_per_set(loso_summary, out_dir)
+        plot_distance_distributions(loso_pairs, out_dir)
+        plot_roc_curve(loso_pairs, out_dir)
+        plot_det_curve(loso_pairs, out_dir)
+        plot_distance_per_set(loso_summary, out_dir)
+        if "threshold" in loso_summary.columns:
+            plot_loso_threshold_per_set(loso_summary, out_dir)
+        plot_far_frr_per_set(loso_summary, out_dir)
+        plot_aggregate_confusion_matrix(loso_summary, out_dir, title_prefix="Baseline LOSO")
+        plot_dashboard(loso_summary, loso_pairs, out_dir)
+
+    # ---- Fusion model plots → per-model dirs ----
+    fusion_results = {name: res for name, res in results.items() if name != baseline_name}
+    for model_name, res in fusion_results.items():
+        out_dir = MODEL_DIRS.get(model_name, VIZ_DIR)
+        print(f"\n[{model_name}]")
+        plot_model_confusion_matrix(res["all_y_true"], res["all_y_pred"], model_name, out_dir)
+        plot_model_roc_curve(res["all_y_true"], res["all_y_score"], model_name, out_dir)
+        plot_model_metrics_per_set(res["fold_metrics"], res["set_ids"], model_name, out_dir)
+        final = res["final_model"]
+        if hasattr(final, "feature_importances_"):
+            plot_feature_importance(final, model_name, out_dir)
+        elif hasattr(final, "coef_"):
+            plot_model_coefficients(final, model_name, out_dir)
+        else:
+            print(f"  [{model_name}] skipped: no coefficient/importance attribute")
+
+    # ---- Comparison → visualizations/ (root) ----
+    if fusion_results and baseline_name in results:
         print("\n[comparison]")
         plot_comparison_report(loso_summary, fusion_results, VIZ_DIR)
 
     print("\nDone.")
-    print(f"  baseline/              → {BASELINE_DIR}")
     for name, cfg in MODELS_CONFIG.items():
         if cfg["enabled"]:
-            print(f"  {MODEL_DIRS[name].split(os.sep)[-1]}/  → {MODEL_DIRS[name]}")
+            slug = MODEL_DIRS[name].split(os.sep)[-1]
+            print(f"  {slug}/  → {MODEL_DIRS[name]}")
     print(f"  comparison_report.png  → {VIZ_DIR}")
 
 
