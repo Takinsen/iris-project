@@ -12,4 +12,3 @@ dependencies:
     - open-iris
     - kagglehub
     - scikit-learn
-    - xgboost

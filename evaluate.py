@@ -5,27 +5,82 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from sklearn.metrics import roc_curve, auc, accuracy_score, precision_score, recall_score, f1_score, balanced_accuracy_score
-from sklearn.tree import DecisionTreeClassifier
-try:
-    from xgboost import XGBClassifier
-    XGBOOST_AVAILABLE = True
-except ImportError:
-    XGBClassifier = None
-    XGBOOST_AVAILABLE = False
+from sklearn.metrics import (roc_curve, auc, accuracy_score, precision_score,
+                             recall_score, f1_score, balanced_accuracy_score)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import GaussianNB
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
+# ------------------------------------------------------------------
+# Output paths
+# ------------------------------------------------------------------
 OUTPUT_ROOT  = r".\out_CASIA_Iris_Thousand_MultiSet_L"
 VIZ_DIR      = os.path.join(OUTPUT_ROOT, "visualizations")
 BASELINE_DIR = os.path.join(VIZ_DIR, "baseline")
-DT_DIR       = os.path.join(VIZ_DIR, "decision_tree")
-XGB_DIR      = os.path.join(VIZ_DIR, "xgboost")
+RF_DIR       = os.path.join(VIZ_DIR, "random_forest")
+LR_DIR       = os.path.join(VIZ_DIR, "logistic_regression")
+GNB_DIR      = os.path.join(VIZ_DIR, "gaussian_naive_bayes")
+LDA_DIR      = os.path.join(VIZ_DIR, "linear_discriminant_analysis")
 
 FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson"]
-MODEL_DIRS   = {"Decision Tree": DT_DIR, "XGBoost": XGB_DIR}
+MODEL_DIRS   = {
+    "Random Forest":                RF_DIR,
+    "Logistic Regression":          LR_DIR,
+    "Gaussian Naive Bayes":         GNB_DIR,
+    "Linear Discriminant Analysis": LDA_DIR,
+}
+
+# ------------------------------------------------------------------
+# Model Configuration
+# Toggle `enabled` to include/exclude a model.
+# Edit `params` to change hyperparameters without touching training code.
+# ------------------------------------------------------------------
+MODELS_CONFIG = {
+    "Random Forest": {
+        "enabled": True,
+        "params": {
+            "n_estimators": 200,
+            "class_weight": "balanced",
+            "random_state": 42,
+            "n_jobs":       -1,
+        },
+    },
+    "Logistic Regression": {
+        "enabled": True,
+        "params": {
+            "C":            1.0,
+            "class_weight": "balanced",
+            "max_iter":     1000,
+            "random_state": 42,
+        },
+    },
+    "Gaussian Naive Bayes": {
+        "enabled": True,
+        "params": {},
+    },
+    "Linear Discriminant Analysis": {
+        "enabled": True,
+        "params": {
+            "solver": "svd",
+        },
+    },
+}
 
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _instantiate_model(name: str):
+    params = MODELS_CONFIG[name]["params"]
+    constructors = {
+        "Random Forest":                RandomForestClassifier,
+        "Logistic Regression":          LogisticRegression,
+        "Gaussian Naive Bayes":         GaussianNB,
+        "Linear Discriminant Analysis": LinearDiscriminantAnalysis,
+    }
+    return constructors[name](**params)
 
 
 # ------------------------------------------------------------------
@@ -72,18 +127,19 @@ def _eval(model, X: np.ndarray, y: np.ndarray) -> dict:
 
 def run_fusion_evaluation(per_set_dfs: list) -> dict:
     """
-    LOSO cross-validation.
+    LOSO cross-validation for all enabled models in MODELS_CONFIG.
     Returns a dict keyed by model name, each value containing:
       avg_metrics, fold_metrics, set_ids, all_y_true, all_y_pred, all_y_score, final_model
     """
     n = len(per_set_dfs)
-    metric_keys = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
+    metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
+    enabled_names = [name for name, cfg in MODELS_CONFIG.items() if cfg["enabled"]]
 
-    buckets: dict = {"Decision Tree": {"fold_metrics": [], "set_ids": [],
-                                        "all_y_true": [], "all_y_pred": [], "all_y_score": []}}
-    if XGBOOST_AVAILABLE:
-        buckets["XGBoost"] = {"fold_metrics": [], "set_ids": [],
-                               "all_y_true": [], "all_y_pred": [], "all_y_score": []}
+    buckets: dict = {
+        name: {"fold_metrics": [], "set_ids": [],
+               "all_y_true": [], "all_y_pred": [], "all_y_score": []}
+        for name in enabled_names
+    }
 
     for test_idx in range(n):
         print(f"  [fusion] fold {test_idx + 1}/{n} ...", end="\r", flush=True)
@@ -98,50 +154,26 @@ def run_fusion_evaluation(per_set_dfs: list) -> dict:
         X_te, y_te = test_df[FEATURE_COLS].values,  test_df["true_label"].values
         set_id = test_df["set_id"].iloc[0] if "set_id" in test_df.columns else f"set_{test_idx + 1:02d}"
 
-        neg = int((y_tr == 0).sum())
-        pos = int((y_tr == 1).sum())
-
-        # Decision Tree
-        dt = DecisionTreeClassifier(max_depth=5, class_weight="balanced", random_state=42)
-        dt.fit(X_tr, y_tr)
-        b = buckets["Decision Tree"]
-        b["fold_metrics"].append(_eval(dt, X_te, y_te))
-        b["set_ids"].append(set_id)
-        b["all_y_true"].extend(y_te.tolist())
-        b["all_y_pred"].extend(dt.predict(X_te).tolist())
-        b["all_y_score"].extend(dt.predict_proba(X_te)[:, 1].tolist())
-
-        # XGBoost
-        if XGBOOST_AVAILABLE:
-            spw = neg / pos if pos > 0 else 1.0
-            xgb = XGBClassifier(n_estimators=100, max_depth=4, scale_pos_weight=spw,
-                                 random_state=42, eval_metric="logloss", verbosity=0)
-            xgb.fit(X_tr, y_tr)
-            b = buckets["XGBoost"]
-            b["fold_metrics"].append(_eval(xgb, X_te, y_te))
+        for name in enabled_names:
+            model = _instantiate_model(name)
+            model.fit(X_tr, y_tr)
+            b = buckets[name]
+            b["fold_metrics"].append(_eval(model, X_te, y_te))
             b["set_ids"].append(set_id)
             b["all_y_true"].extend(y_te.tolist())
-            b["all_y_pred"].extend(xgb.predict(X_te).tolist())
-            b["all_y_score"].extend(xgb.predict_proba(X_te)[:, 1].tolist())
+            b["all_y_pred"].extend(model.predict(X_te).tolist())
+            b["all_y_score"].extend(model.predict_proba(X_te)[:, 1].tolist())
 
     print()
 
-    # Final models trained on all data (for feature importance)
+    # Final models trained on all data (for plots that need the fitted model)
     all_df = pd.concat(per_set_dfs, ignore_index=True).dropna(subset=FEATURE_COLS)
     X_all, y_all = all_df[FEATURE_COLS].values, all_df["true_label"].values
-    neg_all = int((y_all == 0).sum())
-    pos_all = int((y_all == 1).sum())
 
-    final_dt = DecisionTreeClassifier(max_depth=5, class_weight="balanced", random_state=42)
-    final_dt.fit(X_all, y_all)
-    buckets["Decision Tree"]["final_model"] = final_dt
-
-    if XGBOOST_AVAILABLE:
-        spw_all = neg_all / pos_all if pos_all > 0 else 1.0
-        final_xgb = XGBClassifier(n_estimators=100, max_depth=4, scale_pos_weight=spw_all,
-                                   random_state=42, eval_metric="logloss", verbosity=0)
-        final_xgb.fit(X_all, y_all)
-        buckets["XGBoost"]["final_model"] = final_xgb
+    for name in enabled_names:
+        final = _instantiate_model(name)
+        final.fit(X_all, y_all)
+        buckets[name]["final_model"] = final
 
     # Convert lists → arrays and compute avg metrics
     for b in buckets.values():
@@ -429,11 +461,11 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame, out_dir: str) -> 
 
 
 # ------------------------------------------------------------------
-# Model-specific plots  (saved to DT_DIR or XGB_DIR)
+# Model report plots  (saved to per-model directories)
 # ------------------------------------------------------------------
 
 def plot_model_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray,
-                                 model_name: str, out_dir: str) -> None:
+                                model_name: str, out_dir: str) -> None:
     tp = int(((y_true == 1) & (y_pred == 1)).sum())
     fp = int(((y_true == 0) & (y_pred == 1)).sum())
     fn = int(((y_true == 1) & (y_pred == 0)).sum())
@@ -464,7 +496,7 @@ def plot_model_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray,
 
 
 def plot_model_roc_curve(y_true: np.ndarray, y_score: np.ndarray,
-                          model_name: str, out_dir: str) -> None:
+                         model_name: str, out_dir: str) -> None:
     fpr, tpr, _ = roc_curve(y_true, y_score)
     roc_auc = auc(fpr, tpr)
 
@@ -485,12 +517,12 @@ def plot_model_roc_curve(y_true: np.ndarray, y_score: np.ndarray,
 
 
 def plot_model_metrics_per_set(fold_metrics: list, set_ids: list,
-                                model_name: str, out_dir: str) -> None:
+                               model_name: str, out_dir: str) -> None:
     metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
     metric_labels = ["Accuracy", "Precision", "Recall", "F1", "Bal. Acc."]
-    x = np.arange(len(set_ids))
+    x      = np.arange(len(set_ids))
     colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2"]
-    width = 0.15
+    width  = 0.15
 
     fig, ax = plt.subplots(figsize=(max(12, len(set_ids) * 0.7), 5))
     for i, (k, label, c) in enumerate(zip(metric_keys, metric_labels, colors)):
@@ -532,6 +564,30 @@ def plot_feature_importance(model, model_name: str, out_dir: str) -> None:
     print(f"  [{model_name}] saved: feature_importance.png")
 
 
+def plot_model_coefficients(model, model_name: str, out_dir: str) -> None:
+    coef = model.coef_[0] if model.coef_.ndim > 1 else model.coef_
+    sorted_idx  = np.argsort(np.abs(coef))[::-1]
+    sorted_feat = [FEATURE_COLS[i] for i in sorted_idx]
+    sorted_coef = coef[sorted_idx]
+    colors = ["#4C72B0" if v >= 0 else "#DD8452" for v in sorted_coef]
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    bars = ax.bar(sorted_feat, sorted_coef, color=colors, alpha=0.85)
+    for bar, val in zip(bars, sorted_coef):
+        offset = 0.002 if val >= 0 else -0.012
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + offset,
+                f"{val:.4f}", ha="center", va="bottom", fontsize=9)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_ylabel("Coefficient")
+    ax.set_title(f"Feature Coefficients — {model_name}\n(trained on all sets, blue=positive, orange=negative)")
+    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "coefficients.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [{model_name}] saved: coefficients.png")
+
+
 # ------------------------------------------------------------------
 # Comparison plot  (saved to VIZ_DIR root)
 # ------------------------------------------------------------------
@@ -540,17 +596,18 @@ def plot_comparison_report(summary: pd.DataFrame, fusion_results: dict, out_dir:
     metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
     metric_labels = ["Accuracy", "Precision", "Recall", "F1", "Bal. Accuracy"]
 
-    baseline_avg = {k: float(summary[k].mean()) for k in metric_keys}
+    baseline_avg    = {k: float(summary[k].mean()) for k in metric_keys}
     approach_names  = ["Baseline\n(Hamming 0.38)"] + [f"Fusion\n{n}" for n in fusion_results]
     approach_values = [baseline_avg] + [r["avg_metrics"] for r in fusion_results.values()]
-    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52"][:len(approach_names)]
+    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2"]
+    colors  = (palette * ((len(approach_names) // len(palette)) + 1))[:len(approach_names)]
 
     n_metrics    = len(metric_keys)
     n_approaches = len(approach_names)
     x     = np.arange(n_metrics)
     width = 0.75 / n_approaches
 
-    fig, ax = plt.subplots(figsize=(13, 6))
+    fig, ax = plt.subplots(figsize=(14, 6))
     for i, (name, metrics, color) in enumerate(zip(approach_names, approach_values, colors)):
         offsets = x + (i - n_approaches / 2 + 0.5) * width
         vals = [metrics[k] for k in metric_keys]
@@ -578,7 +635,8 @@ def plot_comparison_report(summary: pd.DataFrame, fusion_results: dict, out_dir:
 # ------------------------------------------------------------------
 
 def main() -> None:
-    for d in [VIZ_DIR, BASELINE_DIR, DT_DIR, XGB_DIR]:
+    enabled_dirs = [MODEL_DIRS[name] for name, cfg in MODELS_CONFIG.items() if cfg["enabled"]]
+    for d in [VIZ_DIR, BASELINE_DIR] + enabled_dirs:
         ensure_dir(d)
 
     print(f"Loading data from: {OUTPUT_ROOT}")
@@ -586,6 +644,11 @@ def main() -> None:
     pairs         = load_all_pair_records()
     per_set_multi = load_all_multi_score_features()
     print(f"  {len(summary)} sets | {len(pairs):,} pair records | {len(per_set_multi)} multi-score sets")
+
+    print("\nEnabled models:")
+    for name, cfg in MODELS_CONFIG.items():
+        status = "ON " if cfg["enabled"] else "OFF"
+        print(f"  [{status}] {name}  params={cfg['params']}")
 
     # ---- Baseline plots → visualizations/baseline/ ----
     print("\n[baseline]")
@@ -598,13 +661,10 @@ def main() -> None:
     plot_aggregate_confusion_matrix(summary, BASELINE_DIR, title_prefix="Baseline")
     plot_dashboard(summary, pairs, BASELINE_DIR)
 
-    # ---- Fusion plots → visualizations/decision_tree/ & xgboost/ ----
+    # ---- Fusion evaluation ----
     if not per_set_multi:
         print("\n  [skip] no multi_score_features.csv found — re-run baseline script first.")
     else:
-        if not XGBOOST_AVAILABLE:
-            print("\n  [warning] xgboost not installed — only Decision Tree will run.")
-
         print("\n[fusion evaluation]")
         fusion_results = run_fusion_evaluation(per_set_multi)
 
@@ -614,17 +674,24 @@ def main() -> None:
             plot_model_confusion_matrix(res["all_y_true"], res["all_y_pred"], model_name, out_dir)
             plot_model_roc_curve(res["all_y_true"], res["all_y_score"], model_name, out_dir)
             plot_model_metrics_per_set(res["fold_metrics"], res["set_ids"], model_name, out_dir)
-            plot_feature_importance(res["final_model"], model_name, out_dir)
+            final = res["final_model"]
+            if hasattr(final, "feature_importances_"):
+                plot_feature_importance(final, model_name, out_dir)
+            elif hasattr(final, "coef_"):
+                plot_model_coefficients(final, model_name, out_dir)
+            else:
+                print(f"  [{model_name}] skipped: no coefficient/importance attribute")
 
         # ---- Comparison → visualizations/ (root) ----
         print("\n[comparison]")
         plot_comparison_report(summary, fusion_results, VIZ_DIR)
 
     print("\nDone.")
-    print(f"  baseline/        → {BASELINE_DIR}")
-    print(f"  decision_tree/   → {DT_DIR}")
-    print(f"  xgboost/         → {XGB_DIR}")
-    print(f"  comparison_report.png → {VIZ_DIR}")
+    print(f"  baseline/              → {BASELINE_DIR}")
+    for name, cfg in MODELS_CONFIG.items():
+        if cfg["enabled"]:
+            print(f"  {MODEL_DIRS[name].split(os.sep)[-1]}/  → {MODEL_DIRS[name]}")
+    print(f"  comparison_report.png  → {VIZ_DIR}")
 
 
 if __name__ == "__main__":
