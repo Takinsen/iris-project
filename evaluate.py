@@ -87,18 +87,20 @@ def _instantiate_model(name: str):
 # Data loading
 # ------------------------------------------------------------------
 
-def load_all_sets_summary() -> pd.DataFrame:
-    df = pd.read_csv(os.path.join(OUTPUT_ROOT, "all_sets_summary.csv"))
-    return df[df["total_unique_pairs"] > 0].reset_index(drop=True)
-
-
-def load_all_pair_records() -> pd.DataFrame:
+def load_per_set_pair_records() -> list:
+    """Return a list of DataFrames, one per set, sorted by set folder name."""
     frames = []
     for fpath in sorted(glob.glob(os.path.join(OUTPUT_ROOT, "**", "pair_records.csv"), recursive=True)):
         df = pd.read_csv(fpath)
-        if len(df) > 0:
-            frames.append(df)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if len(df) == 0:
+            continue
+        if "set_id" not in df.columns:
+            set_id = os.path.basename(os.path.dirname(fpath))
+            df["set_id"] = set_id
+        if "pair_type" not in df.columns and "true_label" in df.columns:
+            df["pair_type"] = df["true_label"].map({1: "genuine", 0: "impostor"})
+        frames.append(df)
+    return frames
 
 
 def load_all_multi_score_features() -> list:
@@ -111,7 +113,105 @@ def load_all_multi_score_features() -> list:
 
 
 # ------------------------------------------------------------------
-# Score-Level Fusion (leave-one-set-out)
+# Baseline — LOSO with optimised threshold
+# ------------------------------------------------------------------
+
+def _find_best_threshold(distances: np.ndarray, y_true: np.ndarray,
+                         n_steps: int = 500) -> float:
+    """Sweep thresholds on training data; return the one that maximises balanced accuracy."""
+    thresholds = np.linspace(distances.min(), distances.max(), n_steps)
+    best_thr, best_score = thresholds[0], -1.0
+    for thr in thresholds:
+        pred  = (distances <= thr).astype(int)
+        score = float(balanced_accuracy_score(y_true, pred))
+        if score > best_score:
+            best_score, best_thr = score, thr
+    return float(best_thr)
+
+
+def run_baseline_loso_evaluation(per_set_pair_records: list) -> dict:
+    """
+    Leave-one-set-out cross-validation for the Hamming distance baseline.
+    For each fold:
+      - Concatenate n-1 sets → find the Hamming threshold that maximises
+        balanced accuracy on those pairs.
+      - Apply that threshold to the held-out set and record metrics.
+    Returns:
+      summary  — DataFrame with one row per fold (metrics, TP/FP/FN/TN, threshold)
+      pairs    — DataFrame of all held-out pairs (for ROC / DET curves)
+    """
+    n = len(per_set_pair_records)
+    rows          = []
+    all_distances = []
+    all_y_true    = []
+    all_y_pred    = []
+    all_pair_type = []
+
+    for test_idx in range(n):
+        print(f"  [baseline LOSO] fold {test_idx + 1}/{n} ...", end="\r", flush=True)
+
+        train_df = pd.concat(
+            [df for i, df in enumerate(per_set_pair_records) if i != test_idx],
+            ignore_index=True,
+        ).dropna(subset=["distance", "true_label"])
+        test_df = per_set_pair_records[test_idx].dropna(subset=["distance", "true_label"])
+
+        best_thr = _find_best_threshold(train_df["distance"].values,
+                                        train_df["true_label"].values)
+
+        d_te   = test_df["distance"].values
+        y_te   = test_df["true_label"].values
+        pred   = (d_te <= best_thr).astype(int)
+
+        tp = int(((y_te == 1) & (pred == 1)).sum())
+        fp = int(((y_te == 0) & (pred == 1)).sum())
+        fn = int(((y_te == 1) & (pred == 0)).sum())
+        tn = int(((y_te == 0) & (pred == 0)).sum())
+
+        gen_d = test_df[test_df["pair_type"] == "genuine"]["distance"].dropna()
+        imp_d = test_df[test_df["pair_type"] == "impostor"]["distance"].dropna()
+        set_id = test_df["set_id"].iloc[0] if "set_id" in test_df.columns else f"set_{test_idx + 1:02d}"
+
+        rows.append({
+            "set_id":                 set_id,
+            "threshold":              best_thr,
+            "accuracy":               float(accuracy_score(y_te, pred)),
+            "precision":              float(precision_score(y_te, pred, zero_division=0)),
+            "recall":                 float(recall_score(y_te, pred, zero_division=0)),
+            "f1":                     float(f1_score(y_te, pred, zero_division=0)),
+            "balanced_accuracy":      float(balanced_accuracy_score(y_te, pred)),
+            "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+            "mean_genuine_distance":  float(gen_d.mean()) if len(gen_d) else np.nan,
+            "std_genuine_distance":   float(gen_d.std())  if len(gen_d) else np.nan,
+            "mean_impostor_distance": float(imp_d.mean()) if len(imp_d) else np.nan,
+            "std_impostor_distance":  float(imp_d.std())  if len(imp_d) else np.nan,
+            "total_unique_pairs":     len(test_df),
+        })
+
+        all_distances.extend(d_te.tolist())
+        all_y_true.extend(y_te.tolist())
+        all_y_pred.extend(pred.tolist())
+        all_pair_type.extend(test_df["pair_type"].tolist() if "pair_type" in test_df.columns
+                             else (["genuine" if v == 1 else "impostor" for v in y_te]))
+
+    print()
+
+    summary = pd.DataFrame(rows)
+    pairs   = pd.DataFrame({
+        "distance":   all_distances,
+        "true_label": all_y_true,
+        "pred_label": all_y_pred,
+        "pair_type":  all_pair_type,
+    })
+
+    metric_keys = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
+    avg_metrics = {k: float(summary[k].mean()) for k in metric_keys}
+
+    return {"summary": summary, "pairs": pairs, "avg_metrics": avg_metrics}
+
+
+# ------------------------------------------------------------------
+# Score-Level Fusion — LOSO (unchanged logic, model-driven)
 # ------------------------------------------------------------------
 
 def _eval(model, X: np.ndarray, y: np.ndarray) -> dict:
@@ -175,7 +275,6 @@ def run_fusion_evaluation(per_set_dfs: list) -> dict:
         final.fit(X_all, y_all)
         buckets[name]["final_model"] = final
 
-    # Convert lists → arrays and compute avg metrics
     for b in buckets.values():
         b["all_y_true"]  = np.array(b["all_y_true"])
         b["all_y_pred"]  = np.array(b["all_y_pred"])
@@ -202,7 +301,7 @@ def plot_metrics_per_set(summary: pd.DataFrame, out_dir: str) -> None:
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylim(0, 1.08)
     ax.set_ylabel("Score")
-    ax.set_title("Evaluation Metrics per Set")
+    ax.set_title("Evaluation Metrics per Set  (LOSO, threshold optimised on training folds)")
     ax.legend(loc="lower right", fontsize=8)
     ax.yaxis.grid(True, linestyle="--", alpha=0.5)
     ax.set_axisbelow(True)
@@ -216,19 +315,12 @@ def plot_distance_distributions(pairs: pd.DataFrame, out_dir: str) -> None:
     genuine  = pairs[pairs["pair_type"] == "genuine"]["distance"].dropna()
     impostor = pairs[pairs["pair_type"] == "impostor"]["distance"].dropna()
 
-    threshold = pairs["distance"].min()
-    if "pred_label" in pairs.columns:
-        m, u = pairs[pairs["pred_label"] == 1]["distance"], pairs[pairs["pred_label"] == 0]["distance"]
-        if len(m) > 0 and len(u) > 0:
-            threshold = (m.max() + u.min()) / 2
-
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.hist(genuine,  bins=80, density=True, alpha=0.65, color="#4C72B0", label=f"Genuine (n={len(genuine):,})")
     ax.hist(impostor, bins=80, density=True, alpha=0.55, color="#DD8452", label=f"Impostor (n={len(impostor):,})")
-    ax.axvline(threshold, color="crimson", linestyle="--", linewidth=1.5, label=f"Threshold ≈ {threshold:.3f}")
     ax.set_xlabel("Hamming Distance")
     ax.set_ylabel("Density")
-    ax.set_title("Genuine vs Impostor Distance Distribution (all sets)")
+    ax.set_title("Genuine vs Impostor Distance Distribution  (all LOSO held-out sets)")
     ax.legend()
     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
     ax.set_axisbelow(True)
@@ -248,7 +340,7 @@ def plot_roc_curve(pairs: pd.DataFrame, out_dir: str) -> None:
     ax.set_ylim([0.0, 1.02])
     ax.set_xlabel("False Positive Rate (FAR)")
     ax.set_ylabel("True Positive Rate (TAR)")
-    ax.set_title("ROC Curve — Baseline (all sets)")
+    ax.set_title("ROC Curve — Baseline LOSO (all held-out sets)")
     ax.legend(loc="lower right")
     ax.grid(True, linestyle="--", alpha=0.4)
     fig.tight_layout()
@@ -279,7 +371,7 @@ def plot_det_curve(pairs: pd.DataFrame, out_dir: str) -> None:
                color="crimson", zorder=5, label=f"EER ≈ {eer * 100:.2f}%")
     ax.set_xlabel("FAR (%)")
     ax.set_ylabel("FRR (%)")
-    ax.set_title("DET Curve — Baseline (all sets)")
+    ax.set_title("DET Curve — Baseline LOSO (all held-out sets)")
     ax.legend()
     ax.grid(True, linestyle="--", alpha=0.4)
     fig.tight_layout()
@@ -290,20 +382,29 @@ def plot_det_curve(pairs: pd.DataFrame, out_dir: str) -> None:
 
 def plot_distance_per_set(summary: pd.DataFrame, out_dir: str) -> None:
     sets = summary["set_id"].tolist()
-    x = np.arange(len(sets))
-    thr = summary["threshold"].iloc[0]
+    x    = np.arange(len(sets))
 
     fig, ax = plt.subplots(figsize=(max(12, len(sets) * 0.7), 5))
     ax.errorbar(x - 0.15, summary["mean_genuine_distance"],  yerr=summary["std_genuine_distance"],
                 fmt="o", color="#4C72B0", capsize=4, label="Genuine (mean ± std)")
     ax.errorbar(x + 0.15, summary["mean_impostor_distance"], yerr=summary["std_impostor_distance"],
                 fmt="s", color="#DD8452", capsize=4, label="Impostor (mean ± std)")
-    ax.step([-0.5, len(sets) - 0.5], [thr, thr], color="crimson", linestyle="--",
-            linewidth=1.2, label=f"Threshold = {thr:.3f}")
+
+    if "threshold" in summary.columns:
+        thresholds = summary["threshold"].values
+        if np.ptp(thresholds) < 1e-6:
+            ax.axhline(thresholds[0], color="crimson", linestyle="--", linewidth=1.2,
+                       label=f"Threshold = {thresholds[0]:.4f}")
+        else:
+            ax.step(np.append(x - 0.5, x[-1] + 0.5),
+                    np.append(thresholds, thresholds[-1]),
+                    color="crimson", linestyle="--", linewidth=1.2, where="post",
+                    label="Best threshold (per fold)")
+
     ax.set_xticks(x)
     ax.set_xticklabels(sets, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Hamming Distance")
-    ax.set_title("Mean Genuine vs Impostor Distance per Set")
+    ax.set_title("Mean Genuine vs Impostor Distance per Set  (LOSO)")
     ax.legend(fontsize=8)
     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
     ax.set_axisbelow(True)
@@ -311,6 +412,30 @@ def plot_distance_per_set(summary: pd.DataFrame, out_dir: str) -> None:
     fig.savefig(os.path.join(out_dir, "distance_per_set.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print("  [baseline] saved: distance_per_set.png")
+
+
+def plot_loso_threshold_per_set(summary: pd.DataFrame, out_dir: str) -> None:
+    sets       = summary["set_id"].tolist()
+    thresholds = summary["threshold"].tolist()
+    x          = np.arange(len(sets))
+    mean_thr   = float(np.mean(thresholds))
+
+    fig, ax = plt.subplots(figsize=(max(12, len(sets) * 0.7), 4))
+    ax.bar(x, thresholds, color="#55A868", alpha=0.8, label="Best threshold (fold)")
+    ax.axhline(mean_thr, color="crimson", linestyle="--", linewidth=1.5,
+               label=f"Mean = {mean_thr:.4f}")
+    ax.set_xticks(x)
+    ax.set_xticklabels(sets, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Hamming Threshold")
+    ax.set_title("Optimised Hamming Threshold per LOSO Fold\n"
+                 "(maximises balanced accuracy on the n-1 training sets)")
+    ax.legend(fontsize=8)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "loso_threshold_per_set.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  [baseline] saved: loso_threshold_per_set.png")
 
 
 def compute_far_frr(summary: pd.DataFrame) -> pd.DataFrame:
@@ -334,7 +459,7 @@ def plot_far_frr_per_set(summary: pd.DataFrame, out_dir: str) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(sets, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("Error Rate (%)")
-    ax.set_title("FAR & FRR per Set (at fixed threshold)")
+    ax.set_title("FAR & FRR per Set  (LOSO, threshold optimised on training folds)")
     ax.legend(fontsize=8)
     ax.yaxis.grid(True, linestyle="--", alpha=0.5)
     ax.set_axisbelow(True)
@@ -374,19 +499,19 @@ def plot_aggregate_confusion_matrix(summary: pd.DataFrame, out_dir: str, title_p
 
 def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame, out_dir: str) -> None:
     fig = plt.figure(figsize=(16, 10))
-    fig.suptitle("Baseline Evaluation Dashboard\nCASIA-Iris-Thousand (Hamming Distance)",
+    fig.suptitle("Baseline Evaluation Dashboard\nCASIA-Iris-Thousand (Hamming Distance, LOSO)",
                  fontsize=14, fontweight="bold")
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+    gs   = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
     sets = summary["set_id"].tolist()
-    x = np.arange(len(sets))
-    thr = summary["threshold"].iloc[0]
+    x    = np.arange(len(sets))
+    mean_thr = float(summary["threshold"].mean()) if "threshold" in summary.columns else 0.38
 
     ax1 = fig.add_subplot(gs[0, 0])
     ax1.plot(x, summary["f1"].fillna(0), marker="o", color="#4C72B0", label="F1")
     ax1.plot(x, summary["balanced_accuracy"].fillna(0), marker="s", color="#DD8452", label="Bal. Acc.")
     ax1.set_xticks(x)
     ax1.set_xticklabels(sets, rotation=90, fontsize=6)
-    ax1.set_ylim(0.9, 1.02)
+    ax1.set_ylim(0, 1.08)
     ax1.set_title("F1 & Balanced Accuracy per Set", fontsize=9)
     ax1.legend(fontsize=7)
     ax1.grid(True, linestyle="--", alpha=0.4)
@@ -396,7 +521,8 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame, out_dir: str) -> 
     impostor = pairs[pairs["pair_type"] == "impostor"]["distance"].dropna()
     ax2.hist(genuine,  bins=60, density=True, alpha=0.65, color="#4C72B0", label="Genuine")
     ax2.hist(impostor, bins=60, density=True, alpha=0.55, color="#DD8452", label="Impostor")
-    ax2.axvline(thr, color="crimson", linestyle="--", linewidth=1.2, label=f"thr={thr:.3f}")
+    ax2.axvline(mean_thr, color="crimson", linestyle="--", linewidth=1.2,
+                label=f"Mean thr={mean_thr:.4f}")
     ax2.set_title("Distance Distribution", fontsize=9)
     ax2.set_xlabel("Hamming Distance", fontsize=8)
     ax2.legend(fontsize=7)
@@ -417,18 +543,20 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame, out_dir: str) -> 
                  fmt="o-", color="#4C72B0", capsize=3, markersize=4, label="Genuine")
     ax4.errorbar(x, summary["mean_impostor_distance"], yerr=summary["std_impostor_distance"],
                  fmt="s-", color="#DD8452", capsize=3, markersize=4, label="Impostor")
-    ax4.axhline(thr, color="crimson", linestyle="--", linewidth=1, label=f"thr={thr:.3f}")
+    if "threshold" in summary.columns:
+        ax4.plot(x, summary["threshold"].values, color="crimson", linestyle="--",
+                 linewidth=1, marker="x", markersize=5, label="Best threshold")
     ax4.set_xticks(x)
     ax4.set_xticklabels(sets, rotation=90, fontsize=6)
-    ax4.set_title("Mean Distance per Set", fontsize=9)
+    ax4.set_title("Mean Distance + Threshold per Set", fontsize=9)
     ax4.legend(fontsize=7)
     ax4.grid(True, linestyle="--", alpha=0.4)
 
     ax5 = fig.add_subplot(gs[1, 1])
     tp, fp = int(summary["TP"].sum()), int(summary["FP"].sum())
     fn, tn = int(summary["FN"].sum()), int(summary["TN"].sum())
-    vals = np.array([[tp, fn], [fp, tn]])
-    im = ax5.imshow(vals, cmap="Blues")
+    vals   = np.array([[tp, fn], [fp, tn]])
+    im     = ax5.imshow(vals, cmap="Blues")
     ax5.set_xticks([0, 1])
     ax5.set_yticks([0, 1])
     ax5.set_xticklabels(["Pred Match", "Pred Non-Match"], fontsize=7)
@@ -441,14 +569,17 @@ def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame, out_dir: str) -> 
     ax5.set_title("Aggregate Confusion Matrix", fontsize=9)
 
     df_ff = compute_far_frr(summary)
-    ax6 = fig.add_subplot(gs[1, 2])
+    ax6   = fig.add_subplot(gs[1, 2])
     ax6.axis("off")
-    rows = []
+    rows_tbl = []
     for col, label in zip(["accuracy", "f1", "balanced_accuracy", "far", "frr"],
                            ["Accuracy", "F1", "Bal. Acc.", "FAR", "FRR"]):
         v = df_ff[col].dropna()
-        rows.append([label, f"{v.mean():.4f}", f"{v.std():.4f}", f"{v.min():.4f}", f"{v.max():.4f}"])
-    tbl = ax6.table(cellText=rows, colLabels=["Metric", "Mean", "Std", "Min", "Max"],
+        rows_tbl.append([label, f"{v.mean():.4f}", f"{v.std():.4f}", f"{v.min():.4f}", f"{v.max():.4f}"])
+    if "threshold" in summary.columns:
+        v = summary["threshold"].dropna()
+        rows_tbl.append(["Threshold", f"{v.mean():.4f}", f"{v.std():.4f}", f"{v.min():.4f}", f"{v.max():.4f}"])
+    tbl = ax6.table(cellText=rows_tbl, colLabels=["Metric", "Mean", "Std", "Min", "Max"],
                     loc="center", cellLoc="center")
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(7)
@@ -579,7 +710,8 @@ def plot_model_coefficients(model, model_name: str, out_dir: str) -> None:
                 f"{val:.4f}", ha="center", va="bottom", fontsize=9)
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_ylabel("Coefficient")
-    ax.set_title(f"Feature Coefficients — {model_name}\n(trained on all sets, blue=positive, orange=negative)")
+    ax.set_title(f"Feature Coefficients — {model_name}\n"
+                 "(trained on all sets, blue=positive, orange=negative)")
     ax.yaxis.grid(True, linestyle="--", alpha=0.4)
     ax.set_axisbelow(True)
     fig.tight_layout()
@@ -592,12 +724,12 @@ def plot_model_coefficients(model, model_name: str, out_dir: str) -> None:
 # Comparison plot  (saved to VIZ_DIR root)
 # ------------------------------------------------------------------
 
-def plot_comparison_report(summary: pd.DataFrame, fusion_results: dict, out_dir: str) -> None:
+def plot_comparison_report(loso_summary: pd.DataFrame, fusion_results: dict, out_dir: str) -> None:
     metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
     metric_labels = ["Accuracy", "Precision", "Recall", "F1", "Bal. Accuracy"]
 
-    baseline_avg    = {k: float(summary[k].mean()) for k in metric_keys}
-    approach_names  = ["Baseline\n(Hamming 0.38)"] + [f"Fusion\n{n}" for n in fusion_results]
+    baseline_avg    = {k: float(loso_summary[k].mean()) for k in metric_keys}
+    approach_names  = ["Baseline\n(Hamming LOSO)"] + [f"Fusion\n{n}" for n in fusion_results]
     approach_values = [baseline_avg] + [r["avg_metrics"] for r in fusion_results.values()]
     palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2"]
     colors  = (palette * ((len(approach_names) // len(palette)) + 1))[:len(approach_names)]
@@ -640,26 +772,31 @@ def main() -> None:
         ensure_dir(d)
 
     print(f"Loading data from: {OUTPUT_ROOT}")
-    summary       = load_all_sets_summary()
-    pairs         = load_all_pair_records()
+    per_set_pairs = load_per_set_pair_records()
     per_set_multi = load_all_multi_score_features()
-    print(f"  {len(summary)} sets | {len(pairs):,} pair records | {len(per_set_multi)} multi-score sets")
+    total_pairs   = sum(len(df) for df in per_set_pairs)
+    print(f"  {len(per_set_pairs)} sets | {total_pairs:,} pair records | {len(per_set_multi)} multi-score sets")
 
     print("\nEnabled models:")
     for name, cfg in MODELS_CONFIG.items():
         status = "ON " if cfg["enabled"] else "OFF"
         print(f"  [{status}] {name}  params={cfg['params']}")
 
-    # ---- Baseline plots → visualizations/baseline/ ----
-    print("\n[baseline]")
-    plot_metrics_per_set(summary, BASELINE_DIR)
-    plot_distance_distributions(pairs, BASELINE_DIR)
-    plot_roc_curve(pairs, BASELINE_DIR)
-    plot_det_curve(pairs, BASELINE_DIR)
-    plot_distance_per_set(summary, BASELINE_DIR)
-    plot_far_frr_per_set(summary, BASELINE_DIR)
-    plot_aggregate_confusion_matrix(summary, BASELINE_DIR, title_prefix="Baseline")
-    plot_dashboard(summary, pairs, BASELINE_DIR)
+    # ---- Baseline LOSO → visualizations/baseline/ ----
+    print("\n[baseline — LOSO cross-validation]")
+    baseline     = run_baseline_loso_evaluation(per_set_pairs)
+    loso_summary = baseline["summary"]
+    loso_pairs   = baseline["pairs"]
+
+    plot_metrics_per_set(loso_summary, BASELINE_DIR)
+    plot_distance_distributions(loso_pairs, BASELINE_DIR)
+    plot_roc_curve(loso_pairs, BASELINE_DIR)
+    plot_det_curve(loso_pairs, BASELINE_DIR)
+    plot_distance_per_set(loso_summary, BASELINE_DIR)
+    plot_loso_threshold_per_set(loso_summary, BASELINE_DIR)
+    plot_far_frr_per_set(loso_summary, BASELINE_DIR)
+    plot_aggregate_confusion_matrix(loso_summary, BASELINE_DIR, title_prefix="Baseline LOSO")
+    plot_dashboard(loso_summary, loso_pairs, BASELINE_DIR)
 
     # ---- Fusion evaluation ----
     if not per_set_multi:
@@ -684,7 +821,7 @@ def main() -> None:
 
         # ---- Comparison → visualizations/ (root) ----
         print("\n[comparison]")
-        plot_comparison_report(summary, fusion_results, VIZ_DIR)
+        plot_comparison_report(loso_summary, fusion_results, VIZ_DIR)
 
     print("\nDone.")
     print(f"  baseline/              → {BASELINE_DIR}")
