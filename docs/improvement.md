@@ -1,21 +1,21 @@
 # Improvement: LOSO Evaluation and Score-Level Fusion
 
-This document describes the end-to-end working steps of `evaluate.py`.
+This document describes the core concepts, configuration, hyperparameter tuning, evaluation logic, and output of `evaluate.py`.
 
-**Prerequisites:** `baseline_casia_thousand_multiset.py` must be run first so that `pair_records.csv` and `multi_score_features.csv` exist in each set folder.
+**Prerequisites:** `baseline_casia_thousand_multiset.py` must be run first to generate `pair_records.csv` and `multi_score_features.csv` in each set folder.
 
 ---
 
 ## Overview
 
-`evaluate.py` runs two complementary evaluations on top of the baseline outputs and produces `.png` reports for each:
+`evaluate.py` runs two complementary evaluations on top of the baseline outputs:
 
 | Phase | Input | Method |
 |---|---|---|
-| **Baseline LOSO** | `pair_records.csv` (Hamming distances) | Threshold swept on n-1 sets, applied to test set |
-| **Score-Level Fusion** | `multi_score_features.csv` (4 distance features) | Classifier trained on n-1 sets, predicts on test set |
+| **Baseline LOSO** | `pair_records.csv` (Hamming distances) | Threshold swept on n-1 sets, applied to held-out set |
+| **Score-Level Fusion** | `multi_score_features.csv` (4 distance features) | Classifier trained on n-1 sets, predicts on held-out set |
 
-Both use **Leave-One-Set-Out (LOSO)** cross-validation — each set takes one turn as the held-out test set while the remaining n-1 sets form the training data. This mirrors real deployment: a model trained on known subjects is applied to an unseen group.
+Both phases use **Leave-One-Set-Out (LOSO)** cross-validation inside a single unified training loop. The results are compared in a final side-by-side report.
 
 ---
 
@@ -23,17 +23,45 @@ Both use **Leave-One-Set-Out (LOSO)** cross-validation — each set takes one tu
 
 | Term | Meaning |
 |---|---|
-| **LOSO fold** | One iteration of cross-validation: n-1 sets for training, 1 set as the test set. |
-| **Hamming threshold** | A cut-off value in [0, 1]. Pairs with Hamming distance ≤ threshold are classified as genuine (match). |
-| **Score-level fusion** | Combining multiple similarity scores (Hamming, Jaccard, Cosine, Pearson) into a single classifier decision, instead of relying on Hamming alone. |
-| **Feature columns** | `hamming`, `jaccard`, `cosine`, `pearson` — four distance metrics computed per pair by the baseline script and stored in `multi_score_features.csv`. Lower values mean more similar templates. |
+| **LOSO** | Leave-One-Set-Out — a cross-validation strategy where each set takes one turn as the held-out test fold while all others form the training data. |
+| **LOSO fold** | One iteration: n-1 sets are used for training, 1 set is held out for evaluation. |
+| **Score-level fusion** | Combining multiple distance scores (Hamming, Jaccard, Cosine, Pearson) into a single classification decision, replacing the single Hamming threshold. |
+| **Feature columns** | `hamming`, `jaccard`, `cosine`, `pearson` — four distance metrics per pair, computed by the baseline script. Lower = more similar templates. |
 | **Genuine / Impostor** | Same as in the baseline: genuine = same subject + same eye side; impostor = different subjects. |
+| **Hyperparameter tuning** | Searching for model parameters that maximise cross-validated balanced accuracy on the training folds before committing to predictions on the test fold. |
+| **TPE sampler** | Tree-structured Parzen Estimator — an Optuna Bayesian search strategy that models the objective function to suggest promising parameter regions. |
+
+---
+
+## Core Concept
+
+### Why LOSO?
+
+A standard train/test split would mix subjects between train and test. LOSO ensures **zero subject overlap** between training and test in any fold — the model must generalise to completely unseen identities, exactly like deployment.
+
+```
+Sets:  [set_01] [set_02] [set_03] ... [set_10]
+                                               all different subjects
+
+Fold 1:  Train = set_02 + set_03 + … + set_10   Test = set_01
+Fold 2:  Train = set_01 + set_03 + … + set_10   Test = set_02
+...
+Fold 10: Train = set_01 + … + set_09             Test = set_10
+```
+
+### Why Score-Level Fusion?
+
+The baseline uses only Hamming distance with a single threshold. Score-level fusion trains a classifier on four distance features (`hamming`, `jaccard`, `cosine`, `pearson`) to learn a more expressive decision boundary. The fusion models may capture complementary information not captured by Hamming alone.
+
+### Why Optuna?
+
+Fixed hyperparameters (`C=1.0`, `n_estimators=200`, etc.) may not be optimal for the specific training fold at hand. Optuna runs a Bayesian search over the hyperparameter space, spending more trials in promising regions. The best parameters found on the training fold are then used to fit the final model before predicting on the test fold.
 
 ---
 
 ## Configuration
 
-All model settings live in the `MODELS_CONFIG` dict at the top of `evaluate.py`. Edit this block to enable/disable models, toggle Optuna tuning, or adjust trial budgets — no changes to training code needed.
+All model settings live in `MODELS_CONFIG` at the top of `evaluate.py`.
 
 ```python
 MODELS_CONFIG = {
@@ -57,7 +85,7 @@ MODELS_CONFIG = {
         "param_space":    _rf_space,
         "n_trials":       25,
         "study_n_jobs":   1,        # RF uses n_jobs=-1 internally; don't nest
-        "tune_subsample": 50_000,   # cap rows for Optuna; final fit uses all
+        "tune_subsample": 50_000,   # cap rows for Optuna; final fit uses all data
     },
     "Logistic Regression": {
         "enabled":        True,
@@ -93,187 +121,183 @@ MODELS_CONFIG = {
 }
 ```
 
-### MODELS_CONFIG field reference
+### Field Reference
 
 | Field | Type | Description |
 |---|---|---|
-| `enabled` | bool | Set `False` to skip this model entirely |
-| `hp_tuning` | bool | Set `True` to run Optuna search on each LOSO training fold |
+| `enabled` | bool | `False` = skip this model entirely |
+| `hp_tuning` | bool | `True` = run Optuna search on each LOSO training fold |
 | `params` | dict | Fixed constructor parameters always passed to the model |
-| `param_space` | callable or None | Function `(trial) → dict` that defines the Optuna search space |
+| `param_space` | callable or `None` | Function `(trial) → dict` defining the Optuna search space |
 | `n_trials` | int | Number of Optuna TPE trials per LOSO fold |
-| `study_n_jobs` | int | Parallel Optuna trials (thread-based; set to 1 for RF to avoid CPU over-subscription) |
-| `tune_subsample` | int or None | Max rows passed to the Optuna objective; final model always refits on all training data |
+| `study_n_jobs` | int | Parallel Optuna trials (thread-based). Set to `1` for models with internal `n_jobs` to avoid CPU over-subscription. |
+| `tune_subsample` | int or `None` | Max rows passed to the Optuna objective. Final model always refits on all training data. |
 
-**Output path** is controlled by `OUTPUT_ROOT` at the top of the file (must match the baseline script's `OUTPUT_ROOT`).
+**Output path** is set by `OUTPUT_ROOT` at the top of the file — must match the baseline script's `OUTPUT_ROOT`.
 
 ---
 
 ## Hyperparameter Tuning (Optuna)
 
-When `hp_tuning: True` and `param_space` is provided, each LOSO training fold runs an **Optuna TPE study** before fitting the final model.
+### Search Space Functions
 
-### Search space functions
-
-Each model has a dedicated `_*_space(trial)` function defined above `MODELS_CONFIG`:
+Each model has a dedicated `_*_space(trial)` function that maps an Optuna trial to a parameter dict:
 
 | Function | Model | Parameters searched |
 |---|---|---|
-| `_rf_space` | Random Forest | `n_estimators`, `max_depth`, `min_samples_split`, `min_samples_leaf` |
-| `_lr_space` | Logistic Regression | `C` (regularisation strength, log-uniform in [1e-4, 1e2]) |
-| `_gnb_space` | Gaussian Naive Bayes | `var_smoothing` (log-uniform in [1e-12, 1e-1]) |
-| `_lda_space` | Linear Discriminant Analysis | `solver` (`"svd"` or `"lsqr"`); `shrinkage` only when `solver="lsqr"` |
+| `_rf_space` | Random Forest | `n_estimators` [50–500], `max_depth` {None,5,10,20,30}, `min_samples_split` [2–20], `min_samples_leaf` [1–10] |
+| `_lr_space` | Logistic Regression | `C` log-uniform in [1e-4, 1e2] |
+| `_gnb_space` | Gaussian Naive Bayes | `var_smoothing` log-uniform in [1e-12, 1e-1] |
+| `_lda_space` | Linear Discriminant Analysis | `solver` ∈ {`"svd"`, `"lsqr"`}; `shrinkage` ∈ {None, `"auto"`, 0.1, 0.3, 0.5} **only when** `solver="lsqr"` |
 
-LDA uses **conditional parameters**: `shrinkage` is only valid for `solver="lsqr"` (sklearn raises an error otherwise), so `_lda_space` only includes it in the returned dict when `solver != "svd"`.
+LDA uses **conditional parameters**: `shrinkage` is only valid for `solver="lsqr"` (sklearn raises an error for `solver="svd"`). The `_lda_space` function only includes `shrinkage` in the returned dict when the sampled solver is not `"svd"`.
 
-### `_tune_model` flow
+### `_tune_model` Flow
 
 ```
 _tune_model(name, X_tr, y_tr)
     │
     ├─ hp_tuning=False or param_space=None
-    │       └─ instantiate with base params → fit → return (model, None)
+    │       └─ instantiate with base params → fit(X_tr, y_tr)
+    │          return (model, None)
     │
     └─ hp_tuning=True
             │
-            ├─ subsample X_tr if tune_subsample is set (RF: 50,000 rows)
+            ├─ if tune_subsample set and len(X_tr) > subsample:
+            │       sample subsample rows from X_tr  →  X_opt, y_opt
+            │  else:
+            │       X_opt, y_opt = X_tr, y_tr
             │
-            ├─ create Optuna TPE study
-            │       for each trial (up to n_trials, study_n_jobs parallel):
-            │           sample params from param_space(trial)
-            │           cross_val_score(3-fold StratifiedKFold, scoring="balanced_accuracy")
-            │           return mean CV score
+            ├─ create Optuna TPE study (direction="maximize", seed=42)
             │
-            ├─ select best_params from study.best_params
+            ├─ study.optimize(objective, n_trials=n_trials, n_jobs=study_n_jobs)
+            │       objective(trial):
+            │           params = param_space(trial)           ← sample from search space
+            │           model  = instantiate with base_params + params
+            │           scores = cross_val_score(model, X_opt, y_opt,
+            │                        cv=StratifiedKFold(3), scoring="balanced_accuracy",
+            │                        n_jobs=cv_jobs)
+            │           return scores.mean()
             │
-            └─ refit model on full X_tr (not subsampled) → return (model, best_params)
+            ├─ best_params = study.best_params
+            │
+            └─ best_model = instantiate with base_params + best_params
+               best_model.fit(X_tr, y_tr)     ← always refit on FULL training slice
+               return (best_model, best_params)
 ```
 
-### Parallelism and CPU over-subscription
+### Parallelism and CPU Over-Subscription
 
-`cv_jobs` (parallelism inside `cross_val_score`) is derived automatically:
+`cv_jobs` (parallelism inside `cross_val_score`) is derived automatically to avoid nesting:
 
 ```python
 model_is_parallel = "n_jobs" in cfg["params"]
 cv_jobs = 1 if (model_is_parallel or study_jobs != 1) else -1
 ```
 
-- **RF** (`n_jobs=-1` internally, `study_n_jobs=1`): `cv_jobs=1` — no nesting.
-- **LR / GNB / LDA** (`study_n_jobs=4`): `cv_jobs=1` — study parallelism avoids nested threading.
-- A hypothetical single-threaded, single-trial model would get `cv_jobs=-1` (parallel CV folds).
+| Model | `study_n_jobs` | `cv_jobs` | Reason |
+|---|---|---|---|
+| Random Forest | 1 | 1 | RF uses `n_jobs=-1` internally; no nesting |
+| Logistic Regression | 4 | 1 | Study is parallel; avoid nested threads |
+| Gaussian Naive Bayes | 4 | 1 | Study is parallel; avoid nested threads |
+| Linear Discriminant Analysis | 4 | 1 | Study is parallel; avoid nested threads |
 
-### Best params logging
+### Best Params Logging
 
-When Optuna finds best params, they are printed per fold and stored in `fold_metrics`:
+After each fold, found parameters are printed and stored in `fold_metrics["best_params"]`:
 
 ```
-  [LOSO] fold 3/20 ...
+  [LOSO] fold 3/10 ...
     [Logistic Regression] best params: {'C': 0.04231}
     [Linear Discriminant Analysis] best params: {'solver': 'lsqr', 'shrinkage': 'auto'}
 ```
 
 ---
 
-## Step-by-Step Process
+## LOSO Evaluation Loop
 
-### Step 1 — Load Per-Set Data
-
-`load_all_multi_score_features()` scans all `multi_score_features.csv` files, one per set folder:
+All enabled models (including the Baseline) run inside a single unified loop in `run_loso_evaluation`. For each fold `k`:
 
 ```
-<OUTPUT_ROOT>/set_01_L_<subjects>/multi_score_features.csv
-<OUTPUT_ROOT>/set_02_L_<subjects>/multi_score_features.csv
-...
+train_df = concat(all sets except set k)   |  dropna on feature columns
+test_df  = set k                           |
+
+X_tr, y_tr = train_df[feature_cols], train_df["true_label"]
+X_te, y_te = test_df[feature_cols],  test_df["true_label"]
+
+for each enabled model:
+    model, best_params = _tune_model(name, X_tr, y_tr)
+    y_pred  = model.predict(X_te)
+    y_score = model.predict_proba(X_te)[:, 1]
+    record: accuracy, precision, recall, f1, balanced_accuracy, TP, FP, FN, TN
+    (Baseline also records: threshold, mean/std genuine distance, mean/std impostor distance)
 ```
 
-Each CSV contains the four feature columns (`hamming`, `jaccard`, `cosine`, `pearson`) plus `true_label`, `set_id`, and `pair_type` for every pair in that set.
+After all folds, each model is retrained on **all** sets combined. This final model is used only for feature importance / coefficient plots — the LOSO metrics are not affected.
 
 ---
 
-### Step 2 — Baseline LOSO Evaluation
+## Models
 
-The Baseline (Hamming) model runs inside the same unified LOSO loop as all fusion models (see Step 4). It uses `HammingThresholdClassifier`, a sklearn-compatible wrapper that self-tunes its threshold during `fit()` by sweeping 1000 candidates and maximising balanced accuracy — no Optuna needed.
+### Baseline (Hamming Threshold Classifier)
+
+`HammingThresholdClassifier` is a sklearn-compatible wrapper around the threshold approach:
+
+- `fit()`: sweeps `n_steps` threshold candidates over `[min_distance, max_distance]` of the training pairs and selects the one that maximises `balanced_accuracy_score`
+- `predict()`: applies `distance <= threshold_`
+- `predict_proba()`: returns `1 - hamming` as the genuine probability
+
+This is the same logic as the baseline script but made adaptive — the threshold is optimised on the training folds rather than fixed at 0.38.
+
+### Random Forest
+
+Ensemble of decision trees. `class_weight="balanced"` compensates for the ~54:1 impostor/genuine imbalance. `n_jobs=-1` uses all CPU cores. `tune_subsample=50_000` caps the rows seen during Optuna search (full dataset per fold may exceed 1M pairs).
+
+### Logistic Regression
+
+Linear classifier. Tuned parameter `C` (inverse regularisation strength). `class_weight="balanced"` and `max_iter=2000` ensure convergence on large imbalanced datasets.
+
+### Gaussian Naive Bayes
+
+Assumes each feature is independently Gaussian-distributed per class. No `class_weight` support — class balance is handled implicitly via prior probabilities. Tuned parameter `var_smoothing` adds a small constant to variances for numerical stability.
+
+### Linear Discriminant Analysis (LDA)
+
+Finds a linear projection that maximises class separation. `solver="svd"` (default) does not support shrinkage; `solver="lsqr"` does. When Optuna samples `solver="lsqr"`, it also searches for an optimal `shrinkage` value. LDA is computationally fast — 10 trials is sufficient to cover the small discrete search space.
 
 ---
 
-### Step 3 — Baseline Plots
+## Evaluation Metrics
 
-All plots are saved to `visualizations/baseline/`.
+The same metric set is used for all models:
 
-| File | What it shows |
+| Metric | Formula | Notes |
+|---|---|---|
+| **Accuracy** | (TP + TN) / total | Can be misleading with imbalanced pairs (~54:1) |
+| **Precision** | TP / (TP + FP) | Of predicted matches, how many are genuine |
+| **Recall (TAR)** | TP / (TP + FN) | Of genuine pairs, how many were detected |
+| **F1-score** | 2·P·R / (P+R) | Harmonic mean; robust to imbalance |
+| **Balanced Accuracy** | (TPR + TNR) / 2 | Primary metric for tuning; equal weight to both classes |
+
+---
+
+## Plots and Output
+
+### Baseline plots — `visualizations/baseline/`
+
+| File | Content |
 |---|---|
-| `metrics_per_set.png` | Bar chart of accuracy, precision, recall, F1, balanced accuracy per LOSO fold |
-| `distance_distribution.png` | Overlapping histograms of genuine vs impostor Hamming distances across all held-out pairs |
-| `roc_curve.png` | ROC curve (AUC) across all held-out pairs |
-| `det_curve.png` | DET curve with EER marked |
-| `distance_per_set.png` | Mean genuine and impostor distance per fold with per-fold threshold step line |
-| `loso_threshold_per_set.png` | Bar chart of the optimised threshold selected per fold and the mean |
-| `far_frr_per_set.png` | FAR and FRR per fold at each fold's selected threshold |
+| `metrics_per_set.png` | Bar chart of all metrics per LOSO fold |
+| `distance_distribution.png` | Genuine vs impostor Hamming distance histograms (all held-out pairs) |
+| `roc_curve.png` | ROC curve with AUC |
+| `det_curve.png` | DET curve with Equal Error Rate (EER) marked |
+| `distance_per_set.png` | Mean genuine / impostor distance per fold with threshold step line |
+| `loso_threshold_per_set.png` | Optimised threshold value per fold and mean |
+| `far_frr_per_set.png` | FAR and FRR per fold |
 | `aggregate_confusion_matrix.png` | Summed TP/FP/FN/TN across all folds |
-| `dashboard.png` | 6-panel summary: F1/balanced-acc trends, distance distribution, ROC, distance + threshold per set, confusion matrix, aggregate metrics table |
+| `dashboard.png` | 6-panel summary: F1/balanced-acc trends, distance distribution, ROC, distance+threshold, confusion matrix, aggregate table |
 
----
-
-### Step 4 — Score-Level Fusion LOSO Evaluation
-
-`run_loso_evaluation(per_set_multi_score_dfs)` trains and evaluates all enabled models (including the Baseline) in a single unified loop.
-
-#### 4a — Feature Matrix
-
-Each row in `multi_score_features.csv` is one pair with four input features:
-
-| Feature | Description |
-|---|---|
-| `hamming` | Hamming distance between the two IrisCodes (primary biometric score) |
-| `jaccard` | Jaccard distance on binarised template bits |
-| `cosine` | Cosine distance on raw template bits |
-| `pearson` | Pearson correlation distance on raw template bits |
-
-The target label is `true_label` (1 = genuine, 0 = impostor).
-
-#### 4b — Split, Tune, and Train
-
-For each fold `k`:
-
-```
-X_train, y_train = feature rows from n-1 sets
-X_test,  y_test  = feature rows from set k
-```
-
-Each enabled model is tuned and fitted via `_tune_model`:
-
-```python
-model, best_params = _tune_model(name, X_tr, y_tr)
-# If hp_tuning=True: runs Optuna TPE study, refits on full X_tr with best params
-# If hp_tuning=False: fits directly with base params (e.g. Baseline threshold sweep)
-if best_params:
-    print(f"  [{name}] best params: {best_params}")
-```
-
-#### 4c — Predict and Record
-
-```python
-y_pred  = model.predict(X_test)
-y_score = model.predict_proba(X_test)[:, 1]   # probability of being genuine
-```
-
-Metrics recorded per fold (same set as baseline): accuracy, precision, recall, F1, balanced accuracy, TP, FP, FN, TN. If `best_params` is not None, it is also stored under `metrics["best_params"]`.
-
-#### 4d — Final Model
-
-After all folds, each model is re-tuned and retrained on **all** sets combined:
-
-```python
-final, best_params = _tune_model(name, X_all, y_all)
-```
-
-This final model is used only for feature importance and coefficient plots, not for the reported LOSO metrics.
-
----
-
-### Step 5 — Per-Model Plots
-
-Each enabled model gets its own output directory under `visualizations/`:
+### Per-model plots — `visualizations/<model_dir>/`
 
 | Directory | Model |
 |---|---|
@@ -283,31 +307,19 @@ Each enabled model gets its own output directory under `visualizations/`:
 | `gaussian_naive_bayes/` | Gaussian Naive Bayes |
 | `linear_discriminant_analysis/` | Linear Discriminant Analysis |
 
-Each directory contains:
+Each model directory contains:
 
-| File | What it shows | Models |
+| File | Content | Models |
 |---|---|---|
-| `confusion_matrix.png` | Aggregate TP/FP/FN/TN across all LOSO held-out predictions | All |
-| `roc_curve.png` | ROC curve (AUC) across all LOSO held-out predictions | All |
+| `confusion_matrix.png` | Aggregate TP/FP/FN/TN across all LOSO predictions | All |
+| `roc_curve.png` | ROC curve (AUC) across all LOSO predictions | All |
 | `metrics_per_set.png` | Bar chart of per-fold metrics | All |
-| `feature_importance.png` | Feature importances (`feature_importances_`) from final model | Random Forest only |
-| `coefficients.png` | Feature coefficients (`coef_`) from final model | Logistic Regression, LDA only |
+| `feature_importance.png` | Feature importances (`feature_importances_`) from final model | Random Forest |
+| `coefficients.png` | Feature coefficients (`coef_`) from final model | Logistic Regression, LDA |
 
-Gaussian Naive Bayes does not expose feature importances or coefficients; it produces the first three plots only.
+### Comparison report — `visualizations/comparison_report.png`
 
----
-
-### Step 6 — Comparison Report
-
-`plot_comparison_report` generates `visualizations/comparison_report.png` — a grouped bar chart placing the Baseline LOSO result side-by-side with each fusion model across all five metrics.
-
-```
-Baseline LOSO  |  Fusion RF  |  Fusion LR  |  Fusion GNB  |  Fusion LDA
-─────────────────────────────────────────────────────────────────────────
-Accuracy  Precision  Recall  F1  Balanced Accuracy
-```
-
-This is the primary summary for comparing whether score-level fusion improves on the single-score Hamming baseline.
+Grouped bar chart placing the Baseline LOSO result side-by-side with each fusion model across all five metrics. Primary summary for deciding whether score-level fusion improves on single-score Hamming.
 
 ---
 
@@ -316,79 +328,69 @@ This is the primary summary for comparing whether score-level fusion improves on
 ```
 <OUTPUT_ROOT>/
   visualizations/
-    comparison_report.png               — all models vs baseline side-by-side
+    comparison_report.png
     baseline/
       metrics_per_set.png
       distance_distribution.png
       roc_curve.png
       det_curve.png
       distance_per_set.png
-      loso_threshold_per_set.png        — optimised threshold per fold
+      loso_threshold_per_set.png
       far_frr_per_set.png
       aggregate_confusion_matrix.png
       dashboard.png
     random_forest/
-      confusion_matrix.png
-      roc_curve.png
-      metrics_per_set.png
-      feature_importance.png
+      confusion_matrix.png  roc_curve.png  metrics_per_set.png  feature_importance.png
     logistic_regression/
-      confusion_matrix.png
-      roc_curve.png
-      metrics_per_set.png
-      coefficients.png
+      confusion_matrix.png  roc_curve.png  metrics_per_set.png  coefficients.png
     gaussian_naive_bayes/
-      confusion_matrix.png
-      roc_curve.png
-      metrics_per_set.png
+      confusion_matrix.png  roc_curve.png  metrics_per_set.png
     linear_discriminant_analysis/
-      confusion_matrix.png
-      roc_curve.png
-      metrics_per_set.png
-      coefficients.png
+      confusion_matrix.png  roc_curve.png  metrics_per_set.png  coefficients.png
 ```
 
 ---
 
-## Data Flow Diagram
+## Data Flow
 
 ```
 baseline_casia_thousand_multiset.py
-  └─ multi_score_features.csv  (one file per set — hamming/jaccard/cosine/pearson + true_label)
+  └─ multi_score_features.csv  (per set — hamming/jaccard/cosine/pearson + true_label)
           │
           ▼
 evaluate.py
+  load_all_multi_score_features()
           │
-          ├─ load_all_multi_score_features()
-          │         │
-          │         ▼
-          │  run_loso_evaluation()          ← single loop over ALL enabled models
-          │     │
-          │     ├─ for each fold k  (k = 0 … n-1):
-          │     │     train = concat(all sets except k)
-          │     │     test  = set k
-          │     │     │
-          │     │     for each enabled model in MODELS_CONFIG:
-          │     │         _tune_model(name, X_tr, y_tr)
-          │     │             ├─ hp_tuning=False → fit directly
-          │     │             └─ hp_tuning=True  → Optuna TPE study
-          │     │                   n_trials × 3-fold CV → best_params
-          │     │                   refit on full X_tr with best_params
-          │     │         model.predict / predict_proba on test set k
-          │     │         record: metrics, best_params, y_pred, y_score
-          │     │
-          │     ├─ for each enabled model:
-          │     │     _tune_model(name, X_all, y_all)  → final_model (all data)
-          │     │
-          │     └─ buckets[model_name] = {fold_metrics, all predictions, final_model}
-          │              │
-          │              ├─ Baseline → baseline plots  → visualizations/baseline/
-          │              └─ Fusion   → per-model plots → visualizations/<model_dir>/
+          ▼
+  run_loso_evaluation()
+      │
+      ├─ for each fold k  (k = 0 … n-1):
+      │       train = concat(all sets except k)
+      │       test  = set k
+      │       │
+      │       for each enabled model:
+      │           _tune_model(name, X_tr, y_tr)
+      │               ├─ hp_tuning=False → fit directly with base params
+      │               └─ hp_tuning=True  →
+      │                     Optuna TPE  (n_trials × 3-fold CV on X_opt)
+      │                         → best_params
+      │                     refit on full X_tr with best_params
+      │           model.predict / predict_proba on test fold k
+      │           record: metrics, best_params, y_pred, y_score
+      │
+      ├─ for each enabled model:
+      │       _tune_model(name, X_all, y_all)   →  final_model (all data combined)
+      │
+      └─ buckets[name] = {fold_metrics, all_predictions, final_model}
+              │
+              ├─ Baseline  →  baseline plots  →  visualizations/baseline/
+              └─ Fusion    →  per-model plots →  visualizations/<model_dir>/
           │
-          └─ plot_comparison_report(loso_summary, fusion_results)
-                     │
-                     ▼
-               visualizations/comparison_report.png
+          ▼
+  plot_comparison_report()
+          │
+          ▼
+  visualizations/comparison_report.png
 ```
 
 ---
@@ -398,13 +400,18 @@ evaluate.py
 ```bash
 conda activate iris-dev
 
-# Step 1 — generate multi_score_features.csv (and pair_records.csv) per set
+# Step 1 — generate pair_records.csv and multi_score_features.csv per set
 python baseline_casia_thousand_multiset.py
 
-# Step 2 — run LOSO evaluation and produce all plots
+# Step 2 — run LOSO evaluation and produce all visualizations
 python evaluate.py
 ```
 
-To disable a model without deleting code, set `"enabled": False` in `MODELS_CONFIG`.  
-To disable Optuna tuning for a model, set `"hp_tuning": False` — the model will use its `"params"` directly.  
-To reduce tuning time, lower `n_trials` or set `tune_subsample` to cap the training rows seen by Optuna.
+**Common adjustments:**
+
+| Goal | Action |
+|---|---|
+| Skip a model | Set `"enabled": False` in `MODELS_CONFIG` |
+| Disable Optuna for a model | Set `"hp_tuning": False` — uses `"params"` directly |
+| Reduce tuning time | Lower `n_trials` or set `tune_subsample` to cap training rows |
+| More parallel trials | Increase `study_n_jobs` (only for models without internal `n_jobs`) |
