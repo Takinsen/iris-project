@@ -13,3 +13,4 @@ dependencies:
     - kagglehub
     - scikit-learn
     - optuna
+    - xgboost

@@ -9,9 +9,9 @@ from sklearn.metrics import (roc_curve, auc, accuracy_score, precision_score,
                              recall_score, f1_score, balanced_accuracy_score)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.naive_bayes import GaussianNB
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_score
+from xgboost import XGBClassifier
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -59,21 +59,22 @@ class HammingThresholdClassifier:
 # ------------------------------------------------------------------
 # Output paths
 # ------------------------------------------------------------------
-OUTPUT_ROOT  = r".\out_CASIA_Iris_Thousand_MultiSet_L"
+TARGET_EYE_SIDE = "L"   # "L" or "R"
+OUTPUT_ROOT  = rf".\out_CASIA_Iris_Thousand_MultiSet_{TARGET_EYE_SIDE}"
 VIZ_DIR      = os.path.join(OUTPUT_ROOT, "visualizations")
 BASELINE_DIR = os.path.join(VIZ_DIR, "baseline")
 RF_DIR       = os.path.join(VIZ_DIR, "random_forest")
 LR_DIR       = os.path.join(VIZ_DIR, "logistic_regression")
-GNB_DIR      = os.path.join(VIZ_DIR, "gaussian_naive_bayes")
-LDA_DIR      = os.path.join(VIZ_DIR, "linear_discriminant_analysis")
+XGB_DIR      = os.path.join(VIZ_DIR, "xgboost")
+MLP_DIR      = os.path.join(VIZ_DIR, "mlp")
 
 FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson"]
 MODEL_DIRS   = {
-    "Baseline (Hamming)":           BASELINE_DIR,
-    "Random Forest":                RF_DIR,
-    "Logistic Regression":          LR_DIR,
-    "Gaussian Naive Bayes":         GNB_DIR,
-    "Linear Discriminant Analysis": LDA_DIR,
+    "Baseline (Hamming)": BASELINE_DIR,
+    "Random Forest":      RF_DIR,
+    "Logistic Regression": LR_DIR,
+    "XGBoost":            XGB_DIR,
+    "MLP":                MLP_DIR,
 }
 
 # ------------------------------------------------------------------
@@ -83,8 +84,8 @@ MODEL_DIRS   = {
 
 def _rf_space(trial):
     return {
-        "n_estimators":      trial.suggest_int("n_estimators", 50, 500),
-        "max_depth":         trial.suggest_categorical("max_depth", [None, 5, 10, 20, 30]),
+        "n_estimators":      trial.suggest_int("n_estimators", 100, 300),
+        "max_depth":         trial.suggest_categorical("max_depth", [None, 5, 10]),
         "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
         "min_samples_leaf":  trial.suggest_int("min_samples_leaf", 1, 10),
     }
@@ -96,20 +97,18 @@ def _lr_space(trial):
     }
 
 
-def _gnb_space(trial):
+def _xgb_space(trial):
     return {
-        "var_smoothing": trial.suggest_float("var_smoothing", 1e-12, 1e-1, log=True),
+        "n_estimators":     trial.suggest_int("n_estimators", 50, 500),
+        "max_depth":        trial.suggest_int("max_depth", 2, 8),
+        "learning_rate":    trial.suggest_float("learning_rate", 1e-5, 0.5, log=True),
+        "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
+        "gamma":            trial.suggest_float("gamma", 0.0, 20.0),
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-6, 10.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-6, 10.0, log=True),
     }
-
-
-def _lda_space(trial):
-    solver = trial.suggest_categorical("solver", ["svd", "lsqr"])
-    result = {"solver": solver}
-    if solver != "svd":
-        result["shrinkage"] = trial.suggest_categorical(
-            "shrinkage", [None, "auto", 0.1, 0.3, 0.5]
-        )
-    return result
 
 
 # ------------------------------------------------------------------
@@ -119,16 +118,16 @@ def _lda_space(trial):
 # ------------------------------------------------------------------
 MODELS_CONFIG = {
     "Baseline (Hamming)": {
-        "enabled":        True,
+        "enabled":        False, 
         "hp_tuning":      False,   # self-tunes via threshold sweep in fit()
-        "params":         {"n_steps": 1000},
+        "params":         {"n_steps": 500},
         "param_space":    None,
         "n_trials":       0,
         "study_n_jobs":   1,
         "tune_subsample": None,
     },
     "Random Forest": {
-        "enabled":        True,
+        "enabled":        False,
         "hp_tuning":      True,
         "params": {
             "class_weight": "balanced",
@@ -141,7 +140,7 @@ MODELS_CONFIG = {
         "tune_subsample": 50_000,   # cap rows fed to Optuna; final fit uses all
     },
     "Logistic Regression": {
-        "enabled":        True,
+        "enabled":        False, 
         "hp_tuning":      True,
         "params": {
             "class_weight": "balanced",
@@ -153,22 +152,34 @@ MODELS_CONFIG = {
         "study_n_jobs":   4,        # 4 parallel trials; LR has no internal n_jobs
         "tune_subsample": None,
     },
-    "Gaussian Naive Bayes": {
-        "enabled":        True,
+    "XGBoost": {
+        "enabled":        True, 
         "hp_tuning":      True,
-        "params":         {},
-        "param_space":    _gnb_space,
-        "n_trials":       15,
-        "study_n_jobs":   4,
-        "tune_subsample": None,
+        "params": {
+            "scale_pos_weight": 50,  # handle class imbalance (neg/pos ratio ~50:1)
+            "random_state":     42,
+            "n_jobs":           -1,
+            "verbosity":        0,
+            "tree_method":      "hist",
+        },
+        "param_space":    _xgb_space,
+        "n_trials":       25,
+        "study_n_jobs":   1,            # XGB uses n_jobs=-1 internally; don't nest
+        "tune_subsample": 50_000,
     },
-    "Linear Discriminant Analysis": {
-        "enabled":        True,
-        "hp_tuning":      True,
-        "params":         {"solver": "svd"},
-        "param_space":    _lda_space,
-        "n_trials":       10,       # only 6 valid solver/shrinkage combos exist
-        "study_n_jobs":   4,
+    "MLP": {
+        "enabled":        False,
+        "hp_tuning":      False,
+        "params": {
+            "hidden_layer_sizes": (128, 64),
+            "alpha":              1e-4,
+            "learning_rate_init": 1e-3,
+            "max_iter":           1000,
+            "random_state":       42,
+        },
+        "param_space":    None,
+        "n_trials":       0,
+        "study_n_jobs":   1,
         "tune_subsample": None,
     },
 }
@@ -179,11 +190,11 @@ def ensure_dir(path: str) -> None:
 
 
 _CONSTRUCTORS = {
-    "Baseline (Hamming)":           HammingThresholdClassifier,
-    "Random Forest":                RandomForestClassifier,
-    "Logistic Regression":          LogisticRegression,
-    "Gaussian Naive Bayes":         GaussianNB,
-    "Linear Discriminant Analysis": LinearDiscriminantAnalysis,
+    "Baseline (Hamming)": HammingThresholdClassifier,
+    "Random Forest":      RandomForestClassifier,
+    "Logistic Regression": LogisticRegression,
+    "XGBoost":            XGBClassifier,
+    "MLP":                MLPClassifier,
 }
 
 
