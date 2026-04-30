@@ -61,21 +61,32 @@ Fixed hyperparameters (`C=1.0`, `n_estimators=200`, etc.) may not be optimal for
 
 ## Configuration
 
+### Eye Side
+
+```python
+TARGET_EYE_SIDE = "L"   # "L" or "R"
+OUTPUT_ROOT = rf".\out_CASIA_Iris_Thousand_MultiSet_{TARGET_EYE_SIDE}"
+```
+
+Change `TARGET_EYE_SIDE` to match the eye side used in the baseline script. All output and visualization paths are derived automatically from this value.
+
+### MODELS_CONFIG
+
 All model settings live in `MODELS_CONFIG` at the top of `evaluate.py`.
 
 ```python
 MODELS_CONFIG = {
     "Baseline (Hamming)": {
-        "enabled":        True,
+        "enabled":        False,
         "hp_tuning":      False,   # self-tunes via threshold sweep in fit()
-        "params":         {"n_steps": 1000},
+        "params":         {"n_steps": 500},
         "param_space":    None,
         "n_trials":       0,
         "study_n_jobs":   1,
         "tune_subsample": None,
     },
     "Random Forest": {
-        "enabled":        True,
+        "enabled":        False,
         "hp_tuning":      True,
         "params": {
             "class_weight": "balanced",
@@ -84,11 +95,11 @@ MODELS_CONFIG = {
         },
         "param_space":    _rf_space,
         "n_trials":       25,
-        "study_n_jobs":   1,        # RF uses n_jobs=-1 internally; don't nest
-        "tune_subsample": 50_000,   # cap rows for Optuna; final fit uses all data
+        "study_n_jobs":   1,
+        "tune_subsample": 50_000,
     },
     "Logistic Regression": {
-        "enabled":        True,
+        "enabled":        False,
         "hp_tuning":      True,
         "params": {
             "class_weight": "balanced",
@@ -100,22 +111,34 @@ MODELS_CONFIG = {
         "study_n_jobs":   4,
         "tune_subsample": None,
     },
-    "Gaussian Naive Bayes": {
+    "XGBoost": {
         "enabled":        True,
         "hp_tuning":      True,
-        "params":         {},
-        "param_space":    _gnb_space,
-        "n_trials":       15,
-        "study_n_jobs":   4,
-        "tune_subsample": None,
+        "params": {
+            "scale_pos_weight": 50,
+            "random_state":     42,
+            "n_jobs":           -1,
+            "verbosity":        0,
+            "tree_method":      "hist",
+        },
+        "param_space":    _xgb_space,
+        "n_trials":       25,
+        "study_n_jobs":   1,
+        "tune_subsample": 50_000,
     },
-    "Linear Discriminant Analysis": {
-        "enabled":        True,
-        "hp_tuning":      True,
-        "params":         {"solver": "svd"},
-        "param_space":    _lda_space,
-        "n_trials":       10,
-        "study_n_jobs":   4,
+    "MLP": {
+        "enabled":        False,
+        "hp_tuning":      False,
+        "params": {
+            "hidden_layer_sizes": (128, 64),
+            "alpha":              1e-4,
+            "learning_rate_init": 1e-3,
+            "max_iter":           1000,
+            "random_state":       42,
+        },
+        "param_space":    None,
+        "n_trials":       0,
+        "study_n_jobs":   1,
         "tune_subsample": None,
     },
 }
@@ -133,24 +156,21 @@ MODELS_CONFIG = {
 | `study_n_jobs` | int | Parallel Optuna trials (thread-based). Set to `1` for models with internal `n_jobs` to avoid CPU over-subscription. |
 | `tune_subsample` | int or `None` | Max rows passed to the Optuna objective. Final model always refits on all training data. |
 
-**Output path** is set by `OUTPUT_ROOT` at the top of the file — must match the baseline script's `OUTPUT_ROOT`.
-
 ---
 
 ## Hyperparameter Tuning (Optuna)
 
 ### Search Space Functions
 
-Each model has a dedicated `_*_space(trial)` function that maps an Optuna trial to a parameter dict:
+Each tuned model has a dedicated `_*_space(trial)` function that maps an Optuna trial to a parameter dict:
 
 | Function | Model | Parameters searched |
 |---|---|---|
-| `_rf_space` | Random Forest | `n_estimators` [50–500], `max_depth` {None,5,10,20,30}, `min_samples_split` [2–20], `min_samples_leaf` [1–10] |
+| `_rf_space` | Random Forest | `n_estimators` [100–300], `max_depth` {None,5,10}, `min_samples_split` [2–20], `min_samples_leaf` [1–10] |
 | `_lr_space` | Logistic Regression | `C` log-uniform in [1e-4, 1e2] |
-| `_gnb_space` | Gaussian Naive Bayes | `var_smoothing` log-uniform in [1e-12, 1e-1] |
-| `_lda_space` | Linear Discriminant Analysis | `solver` ∈ {`"svd"`, `"lsqr"`}; `shrinkage` ∈ {None, `"auto"`, 0.1, 0.3, 0.5} **only when** `solver="lsqr"` |
+| `_xgb_space` | XGBoost | `n_estimators` [50–500], `max_depth` [2–8], `learning_rate` log-uniform [1e-5, 0.5], `subsample` [0.5–1.0], `colsample_bytree` [0.5–1.0], `min_child_weight` [1–30], `gamma` [0–20], `reg_alpha` log-uniform [1e-6, 10], `reg_lambda` log-uniform [1e-6, 10] |
 
-LDA uses **conditional parameters**: `shrinkage` is only valid for `solver="lsqr"` (sklearn raises an error for `solver="svd"`). The `_lda_space` function only includes `shrinkage` in the returned dict when the sampled solver is not `"svd"`.
+MLP does not use Optuna — it runs with fixed `params` directly.
 
 ### `_tune_model` Flow
 
@@ -199,8 +219,8 @@ cv_jobs = 1 if (model_is_parallel or study_jobs != 1) else -1
 |---|---|---|---|
 | Random Forest | 1 | 1 | RF uses `n_jobs=-1` internally; no nesting |
 | Logistic Regression | 4 | 1 | Study is parallel; avoid nested threads |
-| Gaussian Naive Bayes | 4 | 1 | Study is parallel; avoid nested threads |
-| Linear Discriminant Analysis | 4 | 1 | Study is parallel; avoid nested threads |
+| XGBoost | 1 | 1 | XGBoost uses `n_jobs=-1` internally; no nesting |
+| MLP | 1 | — | No Optuna; fits directly on full training slice |
 
 ### Best Params Logging
 
@@ -208,8 +228,7 @@ After each fold, found parameters are printed and stored in `fold_metrics["best_
 
 ```
   [LOSO] fold 3/10 ...
-    [Logistic Regression] best params: {'C': 0.04231}
-    [Linear Discriminant Analysis] best params: {'solver': 'lsqr', 'shrinkage': 'auto'}
+    [XGBoost] best params: {'n_estimators': 312, 'max_depth': 4, 'learning_rate': 0.042, ...}
 ```
 
 ---
@@ -257,13 +276,13 @@ Ensemble of decision trees. `class_weight="balanced"` compensates for the ~54:1 
 
 Linear classifier. Tuned parameter `C` (inverse regularisation strength). `class_weight="balanced"` and `max_iter=2000` ensure convergence on large imbalanced datasets.
 
-### Gaussian Naive Bayes
+### XGBoost
 
-Assumes each feature is independently Gaussian-distributed per class. No `class_weight` support — class balance is handled implicitly via prior probabilities. Tuned parameter `var_smoothing` adds a small constant to variances for numerical stability.
+Gradient-boosted tree ensemble. `scale_pos_weight=50` compensates for the ~54:1 impostor/genuine imbalance (equivalent to `class_weight="balanced"` for XGBoost). `tree_method="hist"` uses histogram-based splits for speed. `n_jobs=-1` uses all CPU cores. `tune_subsample=50_000` caps the Optuna search rows. The search space covers 9 hyperparameters including regularisation terms `reg_alpha` and `reg_lambda`.
 
-### Linear Discriminant Analysis (LDA)
+### MLP (Multi-Layer Perceptron)
 
-Finds a linear projection that maximises class separation. `solver="svd"` (default) does not support shrinkage; `solver="lsqr"` does. When Optuna samples `solver="lsqr"`, it also searches for an optimal `shrinkage` value. LDA is computationally fast — 10 trials is sufficient to cover the small discrete search space.
+Neural network classifier with fixed architecture `(128, 64)` hidden layers. Hyperparameter tuning is disabled (`hp_tuning=False`) — the model uses fixed `alpha=1e-4` and `learning_rate_init=1e-3`. MLP does not expose `feature_importances_` or `coef_`, so feature importance plots are skipped for this model.
 
 ---
 
@@ -304,8 +323,8 @@ The same metric set is used for all models:
 | `baseline/` | Baseline (Hamming) |
 | `random_forest/` | Random Forest |
 | `logistic_regression/` | Logistic Regression |
-| `gaussian_naive_bayes/` | Gaussian Naive Bayes |
-| `linear_discriminant_analysis/` | Linear Discriminant Analysis |
+| `xgboost/` | XGBoost |
+| `mlp/` | MLP |
 
 Each model directory contains:
 
@@ -314,8 +333,8 @@ Each model directory contains:
 | `confusion_matrix.png` | Aggregate TP/FP/FN/TN across all LOSO predictions | All |
 | `roc_curve.png` | ROC curve (AUC) across all LOSO predictions | All |
 | `metrics_per_set.png` | Bar chart of per-fold metrics | All |
-| `feature_importance.png` | Feature importances (`feature_importances_`) from final model | Random Forest |
-| `coefficients.png` | Feature coefficients (`coef_`) from final model | Logistic Regression, LDA |
+| `feature_importance.png` | Feature importances (`feature_importances_`) from final model | Random Forest, XGBoost |
+| `coefficients.png` | Feature coefficients (`coef_`) from final model | Logistic Regression |
 
 ### Comparison report — `visualizations/comparison_report.png`
 
@@ -326,7 +345,7 @@ Grouped bar chart placing the Baseline LOSO result side-by-side with each fusion
 ## Output Structure
 
 ```
-<OUTPUT_ROOT>/
+<OUTPUT_ROOT>/                          e.g. out_CASIA_Iris_Thousand_MultiSet_L/
   visualizations/
     comparison_report.png
     baseline/
@@ -343,10 +362,10 @@ Grouped bar chart placing the Baseline LOSO result side-by-side with each fusion
       confusion_matrix.png  roc_curve.png  metrics_per_set.png  feature_importance.png
     logistic_regression/
       confusion_matrix.png  roc_curve.png  metrics_per_set.png  coefficients.png
-    gaussian_naive_bayes/
+    xgboost/
+      confusion_matrix.png  roc_curve.png  metrics_per_set.png  feature_importance.png
+    mlp/
       confusion_matrix.png  roc_curve.png  metrics_per_set.png
-    linear_discriminant_analysis/
-      confusion_matrix.png  roc_curve.png  metrics_per_set.png  coefficients.png
 ```
 
 ---
@@ -415,3 +434,4 @@ python evaluate.py
 | Disable Optuna for a model | Set `"hp_tuning": False` — uses `"params"` directly |
 | Reduce tuning time | Lower `n_trials` or set `tune_subsample` to cap training rows |
 | More parallel trials | Increase `study_n_jobs` (only for models without internal `n_jobs`) |
+| Switch eye side | Change `TARGET_EYE_SIDE` to `"L"` or `"R"` (must match baseline script) |
