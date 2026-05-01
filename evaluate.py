@@ -1,271 +1,127 @@
 import os
 import glob
+import pickle
+import io
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from sklearn.metrics import (roc_curve, auc, accuracy_score, precision_score,
-                             recall_score, f1_score, balanced_accuracy_score)
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
-from sklearn.model_selection import StratifiedKFold, cross_val_score
-from xgboost import XGBClassifier
-import optuna
-optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-# ------------------------------------------------------------------
-# Baseline classifier — sklearn-compatible wrapper
-# ------------------------------------------------------------------
-
-class HammingThresholdClassifier:
-    """
-    Treats the first FEATURE_COL (hamming) as the sole decision variable.
-    fit()  → sweep thresholds on training pairs to maximise balanced accuracy.
-    predict_proba() → score = 1 - hamming (higher = more likely genuine).
-    feature_importances_ → [1, 0, 0, …] so it works with plot_feature_importance.
-    """
-
-    def __init__(self, n_steps: int = 500):
-        self.n_steps    = n_steps
-        self.threshold_ = 0.38  # sensible default before fit
-
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "HammingThresholdClassifier":
-        distances = X[:, 0]
-        thresholds = np.linspace(distances.min(), distances.max(), self.n_steps)
-        best_thr, best_score = float(thresholds[0]), -1.0
-        for thr in thresholds:
-            score = float(balanced_accuracy_score(y, (distances <= thr).astype(int)))
-            if score > best_score:
-                best_score, best_thr = score, float(thr)
-        self.threshold_ = best_thr
-        return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        return (X[:, 0] <= self.threshold_).astype(int)
-
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        pos = np.clip(1.0 - X[:, 0], 0.0, 1.0)
-        return np.column_stack([1.0 - pos, pos])
-
-    @property
-    def feature_importances_(self) -> np.ndarray:
-        imp    = np.zeros(len(FEATURE_COLS))
-        imp[0] = 1.0  # only 'hamming' matters
-        return imp
+from sklearn.metrics import roc_curve, auc
 
 
 # ------------------------------------------------------------------
-# Output paths
+# Pickle helper — resolves HammingThresholdClassifier pickled from
+# __main__ (when train.py was run directly) into train.module scope.
 # ------------------------------------------------------------------
-TARGET_EYE_SIDE = "L"   # "L" or "R"
-OUTPUT_ROOT  = rf".\out_CASIA_Iris_Thousand_MultiSet_{TARGET_EYE_SIDE}"
-VIZ_DIR      = os.path.join(OUTPUT_ROOT, "visualizations")
-BASELINE_DIR = os.path.join(VIZ_DIR, "baseline")
-RF_DIR       = os.path.join(VIZ_DIR, "random_forest")
-LR_DIR       = os.path.join(VIZ_DIR, "logistic_regression")
-XGB_DIR      = os.path.join(VIZ_DIR, "xgboost")
-MLP_DIR      = os.path.join(VIZ_DIR, "mlp")
 
-FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson"]
-MODEL_DIRS   = {
-    "Baseline (Hamming)": BASELINE_DIR,
-    "Random Forest":      RF_DIR,
-    "Logistic Regression": LR_DIR,
-    "XGBoost":            XGB_DIR,
-    "MLP":                MLP_DIR,
+class _TrainUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "__main__":
+            import train as _train
+            if hasattr(_train, name):
+                return getattr(_train, name)
+        return super().find_class(module, name)
+
+
+def _pickle_load(path: str):
+    with open(path, "rb") as f:
+        return _TrainUnpickler(f).load()
+
+
+# ------------------------------------------------------------------
+# NaN-safe statistics helpers
+# ------------------------------------------------------------------
+
+def _safe_mean(vals: list) -> float:
+    finite = [float(v) for v in vals
+              if v is not None and not np.isnan(float(v))]
+    return float(np.mean(finite)) if finite else float("nan")
+
+
+def _safe_std(vals: list) -> float:
+    finite = [float(v) for v in vals
+              if v is not None and not np.isnan(float(v))]
+    return float(np.std(finite)) if len(finite) > 1 else 0.0
+
+
+# ------------------------------------------------------------------
+# Configuration  (must match train.py)
+# ------------------------------------------------------------------
+
+TARGET_EYE_SIDE = "L"
+OUTPUT_ROOT    = rf".\out_CASIA_Iris_Thousand_MultiSet_{TARGET_EYE_SIDE}"
+MODEL_SAVE_DIR = os.path.join(".", "model")
+VIZ_DIR        = os.path.join(OUTPUT_ROOT, "visualization")
+FEATURE_COLS   = ["hamming", "jaccard", "cosine", "pearson"]
+
+MODEL_DIRS = {
+    "Baseline (Hamming)": "baseline_hamming",
+    "Random Forest":      "random_forest",
+    "Logistic Regression": "logistic_regression",
+    "XGBoost":            "xgboost",
+    "MLP":                "mlp",
 }
 
-# ------------------------------------------------------------------
-# Optuna search-space definitions  (one callable per model)
-# Each receives an optuna.Trial and returns a dict of params to override.
-# ------------------------------------------------------------------
+_PALETTE = {
+    "genuine":  "#2196F3",
+    "impostor": "#F44336",
+    "far":      "#E91E63",
+    "frr":      "#009688",
+    "eer":      "#FF9800",
+    "roc":      "#673AB7",
+}
 
-def _rf_space(trial):
-    return {
-        "n_estimators":      trial.suggest_int("n_estimators", 100, 300),
-        "max_depth":         trial.suggest_categorical("max_depth", [None, 5, 10]),
-        "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
-        "min_samples_leaf":  trial.suggest_int("min_samples_leaf", 1, 10),
-    }
-
-
-def _lr_space(trial):
-    return {
-        "C": trial.suggest_float("C", 1e-4, 1e2, log=True),
-    }
-
-
-def _xgb_space(trial):
-    return {
-        "n_estimators":     trial.suggest_int("n_estimators", 50, 500),
-        "max_depth":        trial.suggest_int("max_depth", 2, 8),
-        "learning_rate":    trial.suggest_float("learning_rate", 1e-5, 0.5, log=True),
-        "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-        "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
-        "gamma":            trial.suggest_float("gamma", 0.0, 20.0),
-        "reg_alpha": trial.suggest_float("reg_alpha", 1e-6, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-6, 10.0, log=True),
-    }
-
-
-# ------------------------------------------------------------------
-# Model Configuration
-# Toggle `enabled` to include/exclude a model.
-# Set `hp_tuning: True` to run Optuna search on each LOSO training fold.
-# ------------------------------------------------------------------
-MODELS_CONFIG = {
-    "Baseline (Hamming)": {
-        "enabled":        False, 
-        "hp_tuning":      False,   # self-tunes via threshold sweep in fit()
-        "params":         {"n_steps": 500},
-        "param_space":    None,
-        "n_trials":       0,
-        "study_n_jobs":   1,
-        "tune_subsample": None,
-    },
-    "Random Forest": {
-        "enabled":        False,
-        "hp_tuning":      True,
-        "params": {
-            "class_weight": "balanced",
-            "random_state": 42,
-            "n_jobs":       -1,
-        },
-        "param_space":    _rf_space,
-        "n_trials":       25,
-        "study_n_jobs":   1,        # RF uses n_jobs=-1 internally; don't nest
-        "tune_subsample": 50_000,   # cap rows fed to Optuna; final fit uses all
-    },
-    "Logistic Regression": {
-        "enabled":        False, 
-        "hp_tuning":      True,
-        "params": {
-            "class_weight": "balanced",
-            "max_iter":     2000,
-            "random_state": 42,
-        },
-        "param_space":    _lr_space,
-        "n_trials":       20,
-        "study_n_jobs":   4,        # 4 parallel trials; LR has no internal n_jobs
-        "tune_subsample": None,
-    },
-    "XGBoost": {
-        "enabled":        True, 
-        "hp_tuning":      True,
-        "params": {
-            "scale_pos_weight": 50,  # handle class imbalance (neg/pos ratio ~50:1)
-            "random_state":     42,
-            "n_jobs":           -1,
-            "verbosity":        0,
-            "tree_method":      "hist",
-        },
-        "param_space":    _xgb_space,
-        "n_trials":       25,
-        "study_n_jobs":   1,            # XGB uses n_jobs=-1 internally; don't nest
-        "tune_subsample": 50_000,
-    },
-    "MLP": {
-        "enabled":        False,
-        "hp_tuning":      False,
-        "params": {
-            "hidden_layer_sizes": (128, 64),
-            "alpha":              1e-4,
-            "learning_rate_init": 1e-3,
-            "max_iter":           1000,
-            "random_state":       42,
-        },
-        "param_space":    None,
-        "n_trials":       0,
-        "study_n_jobs":   1,
-        "tune_subsample": None,
-    },
+METRIC_LABELS = {
+    "accuracy":          "Accuracy",
+    "balanced_accuracy": "Balanced Acc.",
+    "precision":         "Precision",
+    "recall":            "Recall / TPR",
+    "f1":                "F1 Score",
+    "eer":               "EER (lower=better)",
 }
 
 
-def ensure_dir(path: str) -> None:
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def ensure_dir(path: str) -> str:
     os.makedirs(path, exist_ok=True)
+    return path
 
 
-_CONSTRUCTORS = {
-    "Baseline (Hamming)": HammingThresholdClassifier,
-    "Random Forest":      RandomForestClassifier,
-    "Logistic Regression": LogisticRegression,
-    "XGBoost":            XGBClassifier,
-    "MLP":                MLPClassifier,
-}
+def _model_slug(name: str) -> str:
+    return (name.lower()
+            .replace(" ", "_")
+            .replace("(", "")
+            .replace(")", "")
+            .replace("/", "_")
+            .strip("_"))
 
 
-def _instantiate_model(name: str, extra_params: dict = None):
-    params = {**MODELS_CONFIG[name]["params"], **(extra_params or {})}
-    return _CONSTRUCTORS[name](**params)
+def _compute_eer(y_true: np.ndarray, y_score: np.ndarray) -> tuple:
+    """Returns (eer, eer_threshold). y_score must be genuine-ascending."""
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    fnr = 1.0 - tpr
+    idx = np.argmin(np.abs(fpr - fnr))
+    return float((fpr[idx] + fnr[idx]) / 2.0), float(thresholds[idx])
 
 
-def _tune_model(name: str, X_tr: np.ndarray, y_tr: np.ndarray):
+def _genuine_score(b: dict) -> np.ndarray:
     """
-    Fit a model for `name` on (X_tr, y_tr).
-    If hp_tuning=True and param_space is provided, runs an Optuna TPE study.
-    Speed knobs (all from MODELS_CONFIG):
-      n_trials       — Optuna iterations
-      study_n_jobs   — parallel Optuna trials (thread-based; safe when model
-                       has no internal n_jobs); set to 1 for RF which uses
-                       n_jobs=-1 internally to avoid CPU over-subscription
-      tune_subsample — max rows passed to the Optuna objective; the final
-                       model is always refit on the full training slice
-    cv_jobs is derived automatically: -1 (parallel CV folds) when both the
-    model and the study are single-threaded; 1 otherwise.
-    Returns (fitted_model, best_trial_params_or_None).
+    Returns y_score in genuine-ascending order (higher = more genuine).
+    For distance models (score = Hamming distance), flips to 1 - score.
     """
-    cfg         = MODELS_CONFIG[name]
-    param_space = cfg.get("param_space")
-    if not cfg.get("hp_tuning", False) or param_space is None:
-        model = _instantiate_model(name)
-        model.fit(X_tr, y_tr)
-        return model, None
+    s = b["all_y_score"]
+    return 1.0 - s if b.get("score_is_distance") else s
 
-    n_trials   = cfg.get("n_trials", 30)
-    study_jobs = cfg.get("study_n_jobs", 1)
-    subsample  = cfg.get("tune_subsample")
 
-    # Parallel CV folds only when neither the model nor the study already
-    # introduces its own parallelism (avoids CPU over-subscription).
-    model_is_parallel = "n_jobs" in cfg["params"]
-    cv_jobs = 1 if (model_is_parallel or study_jobs != 1) else -1
-    cv      = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-
-    # Subsample training data for the Optuna search only
-    if subsample and len(X_tr) > subsample:
-        rng        = np.random.default_rng(42)
-        idx        = rng.choice(len(X_tr), size=subsample, replace=False)
-        X_opt, y_opt = X_tr[idx], y_tr[idx]
-    else:
-        X_opt, y_opt = X_tr, y_tr
-
-    def objective(trial):
-        scores = cross_val_score(
-            _instantiate_model(name, param_space(trial)),
-            X_opt, y_opt,
-            cv=cv, scoring="balanced_accuracy", n_jobs=cv_jobs,
-        )
-        return float(scores.mean())
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-    )
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        n_jobs=study_jobs,
-        show_progress_bar=False,
-    )
-
-    best_trial_params = study.best_params
-    best_model = _instantiate_model(name, best_trial_params)
-    best_model.fit(X_tr, y_tr)   # always refit on full training slice
-    return best_model, best_trial_params
+def _save(fig, path: str) -> None:
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"    saved → {path}")
 
 
 # ------------------------------------------------------------------
@@ -274,685 +130,579 @@ def _tune_model(name: str, X_tr: np.ndarray, y_tr: np.ndarray):
 
 def load_all_multi_score_features() -> list:
     frames = []
-    for fpath in sorted(glob.glob(os.path.join(OUTPUT_ROOT, "**", "multi_score_features.csv"), recursive=True)):
+    for fpath in sorted(glob.glob(
+            os.path.join(OUTPUT_ROOT, "**", "multi_score_features.csv"),
+            recursive=True)):
         df = pd.read_csv(fpath)
         if len(df) > 0:
             frames.append(df)
     return frames
 
 
-# ------------------------------------------------------------------
-# Unified LOSO evaluation — Baseline + all fusion models in one loop
-# ------------------------------------------------------------------
+def load_model_results(model_name: str) -> dict | None:
+    """
+    Loads fold_*.csv + fold_metrics.csv + final_model.pkl for a model.
+    Returns a bucket dict, or None if no fold CSVs are found.
+    """
+    slug      = _model_slug(model_name)
+    model_dir = os.path.join(MODEL_SAVE_DIR, slug)
+    fold_paths = sorted(glob.glob(os.path.join(model_dir, "fold_[0-9]*.csv")))
+    if not fold_paths:
+        return None
 
-def _eval(model, X: np.ndarray, y: np.ndarray) -> dict:
-    yp = model.predict(X)
-    tp = int(((y == 1) & (yp == 1)).sum())
-    fp = int(((y == 0) & (yp == 1)).sum())
-    fn = int(((y == 1) & (yp == 0)).sum())
-    tn = int(((y == 0) & (yp == 0)).sum())
+    all_dfs  = [pd.read_csv(p) for p in fold_paths]
+    combined = pd.concat(all_dfs, ignore_index=True)
+
+    all_y_true    = combined["y_true"].values.astype(int)
+    all_y_pred    = combined["y_pred"].values.astype(int)
+    all_y_score   = combined["y_score"].values.astype(float)   # raw (Hamming for baseline)
+    all_distances = combined["hamming"].values.astype(float)
+    all_pair_types = (combined["pair_type"].tolist()
+                      if "pair_type" in combined.columns else
+                      ["genuine" if y else "impostor" for y in all_y_true])
+
+    fm_path      = os.path.join(model_dir, "fold_metrics.csv")
+    fold_metrics = []
+    set_ids      = []
+    if os.path.exists(fm_path):
+        fm_df        = pd.read_csv(fm_path)
+        fold_metrics = fm_df.to_dict("records")
+        set_ids      = [str(m.get("set_id", f"fold_{i+1:02d}"))
+                        for i, m in enumerate(fold_metrics)]
+
+    metric_keys = ["accuracy", "balanced_accuracy", "precision", "recall", "f1", "eer",
+                   "threshold", "mean_genuine_distance", "mean_impostor_distance"]
+    avg_metrics = {
+        k: _safe_mean([m.get(k) for m in fold_metrics])
+        for k in metric_keys
+    }
+
+    # Baseline stores raw Hamming distance as y_score (lower = more genuine)
+    score_is_distance = (slug == "baseline_hamming")
+
+    # Keep individual fold DataFrames for per-set FAR/FRR and EER-threshold CM
+    fold_dfs = all_dfs
+
+    final_model = None
+    final_path  = os.path.join(model_dir, "final_model.pkl")
+    if os.path.exists(final_path):
+        try:
+            final_model = _pickle_load(final_path)
+        except Exception as e:
+            print(f"  [warn] could not load final_model.pkl: {e}")
+
     return {
-        "accuracy":          float(accuracy_score(y, yp)),
-        "precision":         float(precision_score(y, yp, zero_division=0)),
-        "recall":            float(recall_score(y, yp, zero_division=0)),
-        "f1":                float(f1_score(y, yp, zero_division=0)),
-        "balanced_accuracy": float(balanced_accuracy_score(y, yp)),
-        "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+        "fold_metrics":      fold_metrics,
+        "fold_dfs":          fold_dfs,
+        "set_ids":           set_ids,
+        "all_y_true":        all_y_true,
+        "all_y_pred":        all_y_pred,
+        "all_y_score":       all_y_score,     # raw score (Hamming for baseline)
+        "all_distances":     all_distances,
+        "all_pair_types":    all_pair_types,
+        "final_model":       final_model,
+        "avg_metrics":       avg_metrics,
+        "score_is_distance": score_is_distance,
     }
 
 
-def run_loso_evaluation(per_set_dfs: list) -> dict:
-    """
-    Single LOSO loop over all models enabled in MODELS_CONFIG.
-    Baseline (Hamming) runs here too — its threshold is optimised on each
-    training fold, exactly like sklearn models are fitted.
+# ==================================================================
+# Baseline-specific plots
+# ==================================================================
 
-    Each bucket contains:
-      fold_metrics   — list of per-fold metric dicts (incl. TP/FP/FN/TN;
-                       Baseline also adds threshold + distance stats)
-      set_ids        — set_id string per fold
-      all_y_true / all_y_pred / all_y_score — concatenated LOSO predictions
-      all_distances  — raw hamming distances (used by baseline plots)
-      all_pair_types — "genuine"/"impostor" label per pair
-      final_model    — model re-fitted on ALL data (for feature importance)
-      avg_metrics    — LOSO-averaged metric dict
-    """
-    n             = len(per_set_dfs)
-    metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
-    enabled_names = [name for name, cfg in MODELS_CONFIG.items() if cfg["enabled"]]
-
-    buckets: dict = {
-        name: {"fold_metrics": [], "set_ids": [],
-               "all_y_true": [], "all_y_pred": [], "all_y_score": [],
-               "all_distances": [], "all_pair_types": []}
-        for name in enabled_names
-    }
-
-    for test_idx in range(n):
-        print(f"  [LOSO] fold {test_idx + 1}/{n} ...", flush=True)
-
-        train_df = pd.concat(
-            [df for i, df in enumerate(per_set_dfs) if i != test_idx],
-            ignore_index=True,
-        ).dropna(subset=FEATURE_COLS)
-        test_df = per_set_dfs[test_idx].dropna(subset=FEATURE_COLS)
-
-        X_tr, y_tr = train_df[FEATURE_COLS].values, train_df["true_label"].values
-        X_te, y_te = test_df[FEATURE_COLS].values,  test_df["true_label"].values
-        set_id     = test_df["set_id"].iloc[0] if "set_id" in test_df.columns else f"set_{test_idx + 1:02d}"
-        d_te       = test_df["hamming"].values
-        pt_te      = (test_df["pair_type"].tolist() if "pair_type" in test_df.columns
-                      else np.where(y_te == 1, "genuine", "impostor").tolist())
-
-        for name in enabled_names:
-            model, best_params = _tune_model(name, X_tr, y_tr)
-            if best_params:
-                print(f"    [{name}] best params: {best_params}", flush=True)
-            b       = buckets[name]
-            metrics = _eval(model, X_te, y_te)
-            metrics["set_id"] = set_id
-            if best_params:
-                metrics["best_params"] = str(best_params)
-
-            # Extra stats stored only for threshold-based models (Baseline)
-            if hasattr(model, "threshold_"):
-                metrics["threshold"] = float(model.threshold_)
-                gen_d = d_te[y_te == 1]
-                imp_d = d_te[y_te == 0]
-                metrics["mean_genuine_distance"]  = float(gen_d.mean()) if len(gen_d) else np.nan
-                metrics["std_genuine_distance"]   = float(gen_d.std())  if len(gen_d) else np.nan
-                metrics["mean_impostor_distance"] = float(imp_d.mean()) if len(imp_d) else np.nan
-                metrics["std_impostor_distance"]  = float(imp_d.std())  if len(imp_d) else np.nan
-
-            b["fold_metrics"].append(metrics)
-            b["set_ids"].append(set_id)
-            b["all_y_true"].extend(y_te.tolist())
-            b["all_y_pred"].extend(model.predict(X_te).tolist())
-            b["all_y_score"].extend(model.predict_proba(X_te)[:, 1].tolist())
-            b["all_distances"].extend(d_te.tolist())
-            b["all_pair_types"].extend(pt_te)
-
-    # Final models trained on all data (feature importance / coefficient plots)
-    all_df = pd.concat(per_set_dfs, ignore_index=True).dropna(subset=FEATURE_COLS)
-    X_all, y_all = all_df[FEATURE_COLS].values, all_df["true_label"].values
-    print("  [LOSO] fitting final models on all data ...")
-    for name in enabled_names:
-        final, best_params = _tune_model(name, X_all, y_all)
-        if best_params:
-            print(f"    [{name}] final best params: {best_params}", flush=True)
-        buckets[name]["final_model"] = final
-
-    for b in buckets.values():
-        b["all_y_true"]    = np.array(b["all_y_true"])
-        b["all_y_pred"]    = np.array(b["all_y_pred"])
-        b["all_y_score"]   = np.array(b["all_y_score"])
-        b["all_distances"] = np.array(b["all_distances"])
-        b["avg_metrics"]   = {k: float(np.mean([m[k] for m in b["fold_metrics"]])) for k in metric_keys}
-
-    return buckets
-
-
-# ------------------------------------------------------------------
-# Baseline plots  (saved to BASELINE_DIR)
-# ------------------------------------------------------------------
-
-def plot_metrics_per_set(summary: pd.DataFrame, out_dir: str) -> None:
-    metrics = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
-    labels  = summary["set_id"].tolist()
-    x, width = np.arange(len(labels)), 0.15
-    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2"]
-
-    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 0.7), 5))
-    for i, (m, c) in enumerate(zip(metrics, colors)):
-        ax.bar(x + i * width, summary[m].fillna(0), width, label=m.replace("_", " ").title(), color=c)
-    ax.set_xticks(x + width * (len(metrics) - 1) / 2)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylim(0, 1.08)
-    ax.set_ylabel("Score")
-    ax.set_title("Evaluation Metrics per Set  (LOSO, threshold optimised on training folds)")
-    ax.legend(loc="lower right", fontsize=8)
-    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "metrics_per_set.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: metrics_per_set.png")
-
-
-def plot_distance_distributions(pairs: pd.DataFrame, out_dir: str) -> None:
-    genuine  = pairs[pairs["pair_type"] == "genuine"]["distance"].dropna()
-    impostor = pairs[pairs["pair_type"] == "impostor"]["distance"].dropna()
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.hist(genuine,  bins=80, density=True, alpha=0.65, color="#4C72B0", label=f"Genuine (n={len(genuine):,})")
-    ax.hist(impostor, bins=80, density=True, alpha=0.55, color="#DD8452", label=f"Impostor (n={len(impostor):,})")
+def plot_distance_distributions(b: dict, out_dir: str) -> None:
+    """Hamming distance density — genuine vs impostor."""
+    y_true = b["all_y_true"]
+    gen    = b["all_distances"][y_true == 1]
+    imp    = b["all_distances"][y_true == 0]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bins = np.linspace(0, 1, 80)
+    ax.hist(gen, bins=bins, density=True, alpha=0.55,
+            color=_PALETTE["genuine"],  label=f"Genuine  (n={len(gen):,})")
+    ax.hist(imp, bins=bins, density=True, alpha=0.55,
+            color=_PALETTE["impostor"], label=f"Impostor (n={len(imp):,})")
+    thr = b["avg_metrics"].get("threshold", float("nan"))
+    if not np.isnan(thr):
+        ax.axvline(thr, color="black", ls="--", lw=1.5,
+                   label=f"Avg threshold = {thr:.4f}")
     ax.set_xlabel("Hamming Distance")
     ax.set_ylabel("Density")
-    ax.set_title("Genuine vs Impostor Distance Distribution  (all LOSO held-out sets)")
+    ax.set_title("Hamming Distance Distribution — Genuine vs Impostor")
     ax.legend()
-    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "distance_distribution.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: distance_distribution.png")
+    _save(fig, os.path.join(out_dir, "distance_distribution.png"))
 
 
-def plot_roc_curve(pairs: pd.DataFrame, out_dir: str) -> None:
-    fpr, tpr, _ = roc_curve(pairs["true_label"].values, -pairs["distance"].values)
-    roc_auc = auc(fpr, tpr)
+def plot_loso_threshold_per_set(b: dict, out_dir: str) -> None:
+    """Per-fold fitted Hamming threshold (Baseline only)."""
+    thresholds = [m.get("threshold", float("nan")) for m in b["fold_metrics"]]
+    set_ids    = b["set_ids"]
+    fig, ax = plt.subplots(figsize=(max(8, len(set_ids) * 0.7), 5))
+    ax.plot(set_ids, thresholds, marker="o", color=_PALETTE["genuine"], lw=2)
+    avg = float(np.nanmean(thresholds))
+    ax.axhline(avg, color="gray", ls="--", lw=1.2, label=f"Mean = {avg:.4f}")
+    ax.set_xlabel("Set")
+    ax.set_ylabel("Threshold")
+    ax.set_title("LOSO Hamming Threshold per Set")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend()
+    _save(fig, os.path.join(out_dir, "loso_threshold_per_set.png"))
+
+
+# ==================================================================
+# Per-model plots
+# ==================================================================
+
+def plot_model_confusion_matrix(b: dict, model_name: str, out_dir: str) -> None:
+    """Aggregate confusion matrix at the per-fold EER threshold."""
+    is_dist  = b.get("score_is_distance", False)
+    tp = fp = fn = tn = 0
+
+    for df in b.get("fold_dfs", []):
+        y_true = df["y_true"].values.astype(int)
+        y_raw  = df["y_score"].values.astype(float)
+        y_roc  = 1.0 - y_raw if is_dist else y_raw
+        try:
+            _, eer_thr = _compute_eer(y_true, y_roc)
+        except Exception:
+            continue
+        y_pred = (y_roc >= eer_thr).astype(int)
+        tp += int(((y_true == 1) & (y_pred == 1)).sum())
+        fp += int(((y_true == 0) & (y_pred == 1)).sum())
+        fn += int(((y_true == 1) & (y_pred == 0)).sum())
+        tn += int(((y_true == 0) & (y_pred == 0)).sum())
+
+    cm = np.array([[tp, fn], [fp, tn]])
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    im = ax.imshow(cm, cmap="Blues")
+    plt.colorbar(im, ax=ax)
+    labels = [["TP", "FN"], ["FP", "TN"]]
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, f"{labels[i][j]}\n{cm[i, j]:,}",
+                    ha="center", va="center", fontsize=11,
+                    color="white" if cm[i, j] > cm.max() * 0.6 else "black")
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(["Pred Genuine", "Pred Impostor"])
+    ax.set_yticklabels(["Actual Genuine", "Actual Impostor"])
+    ax.set_title(f"Aggregate Confusion Matrix — {model_name}")
+    _save(fig, os.path.join(out_dir, "confusion_matrix.png"))
+
+
+def plot_model_roc_curve(b: dict, model_name: str, out_dir: str) -> None:
+    y_sc        = _genuine_score(b)   # genuine-ascending (flip if distance model)
+    fpr, tpr, _ = roc_curve(b["all_y_true"], y_sc)
+    roc_auc     = auc(fpr, tpr)
+    eer, _      = _compute_eer(b["all_y_true"], y_sc)
+
     fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(fpr, tpr, color="#4C72B0", lw=2, label=f"ROC (AUC = {roc_auc:.4f})")
-    ax.plot([0, 1], [0, 1], color="gray", linestyle="--", lw=1)
-    ax.set_xlim([-0.01, 1.0])
-    ax.set_ylim([0.0, 1.02])
+    ax.plot(fpr, tpr, color=_PALETTE["roc"], lw=2,
+            label=f"AUC = {roc_auc:.4f}  |  EER = {eer:.4f}")
+    ax.plot([0, 1], [0, 1], "k--", lw=1)
     ax.set_xlabel("False Positive Rate (FAR)")
-    ax.set_ylabel("True Positive Rate (TAR)")
-    ax.set_title("ROC Curve — Baseline LOSO (all held-out sets)")
+    ax.set_ylabel("True Positive Rate (1 − FRR)")
+    ax.set_title(f"ROC Curve — {model_name}")
     ax.legend(loc="lower right")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "roc_curve.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: roc_curve.png")
+    _save(fig, os.path.join(out_dir, "roc_curve.png"))
 
 
-def plot_det_curve(pairs: pd.DataFrame, out_dir: str) -> None:
-    y_true, distances = pairs["true_label"].values, pairs["distance"].values
-    thresholds = np.linspace(distances.min(), distances.max(), 500)
-    far_list, frr_list = [], []
-    for t in thresholds:
-        pred = (distances <= t).astype(int)
-        fp = ((pred == 1) & (y_true == 0)).sum()
-        fn = ((pred == 0) & (y_true == 1)).sum()
-        tn = (y_true == 0).sum()
-        tp = (y_true == 1).sum()
-        far_list.append(fp / tn if tn > 0 else np.nan)
-        frr_list.append(fn / tp if tp > 0 else np.nan)
-    far_arr, frr_arr = np.array(far_list), np.array(frr_list)
-    eer_idx = np.argmin(np.abs(far_arr - frr_arr))
-    eer = (far_arr[eer_idx] + frr_arr[eer_idx]) / 2
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(far_arr * 100, frr_arr * 100, color="#55A868", lw=2)
-    ax.scatter([far_arr[eer_idx] * 100], [frr_arr[eer_idx] * 100],
-               color="crimson", zorder=5, label=f"EER ≈ {eer * 100:.2f}%")
-    ax.set_xlabel("FAR (%)")
-    ax.set_ylabel("FRR (%)")
-    ax.set_title("DET Curve — Baseline LOSO (all held-out sets)")
-    ax.legend()
-    ax.grid(True, linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "det_curve.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: det_curve.png")
-
-
-def plot_distance_per_set(summary: pd.DataFrame, out_dir: str) -> None:
-    sets = summary["set_id"].tolist()
-    x    = np.arange(len(sets))
-
-    fig, ax = plt.subplots(figsize=(max(12, len(sets) * 0.7), 5))
-    ax.errorbar(x - 0.15, summary["mean_genuine_distance"],  yerr=summary["std_genuine_distance"],
-                fmt="o", color="#4C72B0", capsize=4, label="Genuine (mean ± std)")
-    ax.errorbar(x + 0.15, summary["mean_impostor_distance"], yerr=summary["std_impostor_distance"],
-                fmt="s", color="#DD8452", capsize=4, label="Impostor (mean ± std)")
-
-    if "threshold" in summary.columns:
-        thresholds = summary["threshold"].values
-        if np.ptp(thresholds) < 1e-6:
-            ax.axhline(thresholds[0], color="crimson", linestyle="--", linewidth=1.2,
-                       label=f"Threshold = {thresholds[0]:.4f}")
-        else:
-            ax.step(np.append(x - 0.5, x[-1] + 0.5),
-                    np.append(thresholds, thresholds[-1]),
-                    color="crimson", linestyle="--", linewidth=1.2, where="post",
-                    label="Best threshold (per fold)")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(sets, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Hamming Distance")
-    ax.set_title("Mean Genuine vs Impostor Distance per Set  (LOSO)")
-    ax.legend(fontsize=8)
-    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "distance_per_set.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: distance_per_set.png")
-
-
-def plot_loso_threshold_per_set(summary: pd.DataFrame, out_dir: str) -> None:
-    sets       = summary["set_id"].tolist()
-    thresholds = summary["threshold"].tolist()
-    x          = np.arange(len(sets))
-    mean_thr   = float(np.mean(thresholds))
-
-    fig, ax = plt.subplots(figsize=(max(12, len(sets) * 0.7), 4))
-    ax.bar(x, thresholds, color="#55A868", alpha=0.8, label="Best threshold (fold)")
-    ax.axhline(mean_thr, color="crimson", linestyle="--", linewidth=1.5,
-               label=f"Mean = {mean_thr:.4f}")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sets, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Hamming Threshold")
-    ax.set_title("Optimised Hamming Threshold per LOSO Fold\n"
-                 "(maximises balanced accuracy on the n-1 training sets)")
-    ax.legend(fontsize=8)
-    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "loso_threshold_per_set.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: loso_threshold_per_set.png")
-
-
-def compute_far_frr(summary: pd.DataFrame) -> pd.DataFrame:
-    df = summary.copy()
-    df["far"] = df["FP"] / (df["FP"] + df["TN"])
-    df["frr"] = df["FN"] / (df["FN"] + df["TP"])
-    return df
-
-
-def plot_far_frr_per_set(summary: pd.DataFrame, out_dir: str) -> None:
-    df = compute_far_frr(summary)
-    sets = df["set_id"].tolist()
-    x, width = np.arange(len(sets)), 0.35
-    eer_line = ((df["far"] + df["frr"]) / 2 * 100).mean()
-
-    fig, ax = plt.subplots(figsize=(max(12, len(sets) * 0.7), 5))
-    ax.bar(x - width / 2, df["far"] * 100, width, color="#C44E52", label="FAR")
-    ax.bar(x + width / 2, df["frr"] * 100, width, color="#8172B2", label="FRR")
-    ax.axhline(eer_line, color="gray", linestyle=":", linewidth=1,
-               label=f"Mean (FAR+FRR)/2 ≈ {eer_line:.3f}%")
-    ax.set_xticks(x)
-    ax.set_xticklabels(sets, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Error Rate (%)")
-    ax.set_title("FAR & FRR per Set  (LOSO, threshold optimised on training folds)")
-    ax.legend(fontsize=8)
-    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "far_frr_per_set.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: far_frr_per_set.png")
-
-
-def plot_aggregate_confusion_matrix(summary: pd.DataFrame, out_dir: str, title_prefix: str = "Baseline") -> None:
-    tp, fp = int(summary["TP"].sum()), int(summary["FP"].sum())
-    fn, tn = int(summary["FN"].sum()), int(summary["TN"].sum())
-    values = np.array([[tp, fn], [fp, tn]])
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(values, cmap="Blues")
-    fig.colorbar(im, ax=ax)
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(["Predicted Match", "Predicted Non-Match"])
-    ax.set_yticklabels(["Actual Match", "Actual Non-Match"])
-    ax.set_xlabel("Predicted Label")
-    ax.set_ylabel("Actual Label")
-    ax.set_title(f"Aggregate Confusion Matrix — {title_prefix} ({len(summary)} sets)")
-    thresh = values.max() / 2.0
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, f"{values[i, j]:,}", ha="center", va="center",
-                    color="white" if values[i, j] > thresh else "black",
-                    fontsize=14, fontweight="bold")
-    plt.setp(ax.get_xticklabels(), rotation=15, ha="right")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "aggregate_confusion_matrix.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [baseline] saved: aggregate_confusion_matrix.png")
-
-
-def plot_dashboard(summary: pd.DataFrame, pairs: pd.DataFrame, out_dir: str) -> None:
-    fig = plt.figure(figsize=(16, 10))
-    fig.suptitle("Baseline Evaluation Dashboard\nCASIA-Iris-Thousand (Hamming Distance, LOSO)",
-                 fontsize=14, fontweight="bold")
-    gs   = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
-    sets = summary["set_id"].tolist()
-    x    = np.arange(len(sets))
-    mean_thr = float(summary["threshold"].mean()) if "threshold" in summary.columns else 0.38
-
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(x, summary["f1"].fillna(0), marker="o", color="#4C72B0", label="F1")
-    ax1.plot(x, summary["balanced_accuracy"].fillna(0), marker="s", color="#DD8452", label="Bal. Acc.")
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(sets, rotation=90, fontsize=6)
-    ax1.set_ylim(0, 1.08)
-    ax1.set_title("F1 & Balanced Accuracy per Set", fontsize=9)
-    ax1.legend(fontsize=7)
-    ax1.grid(True, linestyle="--", alpha=0.4)
-
-    ax2 = fig.add_subplot(gs[0, 1])
-    genuine  = pairs[pairs["pair_type"] == "genuine"]["distance"].dropna()
-    impostor = pairs[pairs["pair_type"] == "impostor"]["distance"].dropna()
-    ax2.hist(genuine,  bins=60, density=True, alpha=0.65, color="#4C72B0", label="Genuine")
-    ax2.hist(impostor, bins=60, density=True, alpha=0.55, color="#DD8452", label="Impostor")
-    ax2.axvline(mean_thr, color="crimson", linestyle="--", linewidth=1.2,
-                label=f"Mean thr={mean_thr:.4f}")
-    ax2.set_title("Distance Distribution", fontsize=9)
-    ax2.set_xlabel("Hamming Distance", fontsize=8)
-    ax2.legend(fontsize=7)
-    ax2.grid(True, linestyle="--", alpha=0.4)
-
-    ax3 = fig.add_subplot(gs[0, 2])
-    fpr, tpr, _ = roc_curve(pairs["true_label"].values, -pairs["distance"].values)
-    ax3.plot(fpr, tpr, color="#55A868", lw=1.5, label=f"AUC={auc(fpr, tpr):.4f}")
-    ax3.plot([0, 1], [0, 1], "k--", lw=0.8)
-    ax3.set_title("ROC Curve", fontsize=9)
-    ax3.set_xlabel("FAR", fontsize=8)
-    ax3.set_ylabel("TAR", fontsize=8)
-    ax3.legend(fontsize=7)
-    ax3.grid(True, linestyle="--", alpha=0.4)
-
-    ax4 = fig.add_subplot(gs[1, 0])
-    ax4.errorbar(x, summary["mean_genuine_distance"],  yerr=summary["std_genuine_distance"],
-                 fmt="o-", color="#4C72B0", capsize=3, markersize=4, label="Genuine")
-    ax4.errorbar(x, summary["mean_impostor_distance"], yerr=summary["std_impostor_distance"],
-                 fmt="s-", color="#DD8452", capsize=3, markersize=4, label="Impostor")
-    if "threshold" in summary.columns:
-        ax4.plot(x, summary["threshold"].values, color="crimson", linestyle="--",
-                 linewidth=1, marker="x", markersize=5, label="Best threshold")
-    ax4.set_xticks(x)
-    ax4.set_xticklabels(sets, rotation=90, fontsize=6)
-    ax4.set_title("Mean Distance + Threshold per Set", fontsize=9)
-    ax4.legend(fontsize=7)
-    ax4.grid(True, linestyle="--", alpha=0.4)
-
-    ax5 = fig.add_subplot(gs[1, 1])
-    tp, fp = int(summary["TP"].sum()), int(summary["FP"].sum())
-    fn, tn = int(summary["FN"].sum()), int(summary["TN"].sum())
-    vals   = np.array([[tp, fn], [fp, tn]])
-    im     = ax5.imshow(vals, cmap="Blues")
-    ax5.set_xticks([0, 1])
-    ax5.set_yticks([0, 1])
-    ax5.set_xticklabels(["Pred Match", "Pred Non-Match"], fontsize=7)
-    ax5.set_yticklabels(["Act Match", "Act Non-Match"], fontsize=7)
-    thresh_cm = vals.max() / 2.0
-    for i in range(2):
-        for j in range(2):
-            ax5.text(j, i, f"{vals[i, j]:,}", ha="center", va="center",
-                     color="white" if vals[i, j] > thresh_cm else "black", fontsize=10, fontweight="bold")
-    ax5.set_title("Aggregate Confusion Matrix", fontsize=9)
-
-    df_ff = compute_far_frr(summary)
-    ax6   = fig.add_subplot(gs[1, 2])
-    ax6.axis("off")
-    rows_tbl = []
-    for col, label in zip(["accuracy", "f1", "balanced_accuracy", "far", "frr"],
-                           ["Accuracy", "F1", "Bal. Acc.", "FAR", "FRR"]):
-        v = df_ff[col].dropna()
-        rows_tbl.append([label, f"{v.mean():.4f}", f"{v.std():.4f}", f"{v.min():.4f}", f"{v.max():.4f}"])
-    if "threshold" in summary.columns:
-        v = summary["threshold"].dropna()
-        rows_tbl.append(["Threshold", f"{v.mean():.4f}", f"{v.std():.4f}", f"{v.min():.4f}", f"{v.max():.4f}"])
-    tbl = ax6.table(cellText=rows_tbl, colLabels=["Metric", "Mean", "Std", "Min", "Max"],
-                    loc="center", cellLoc="center")
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(7)
-    tbl.scale(1, 1.4)
-    ax6.set_title("Aggregate Metrics Summary", fontsize=9)
-
-    fig.savefig(os.path.join(out_dir, "dashboard.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [baseline] saved: dashboard.png")
-
-
-# ------------------------------------------------------------------
-# Model report plots  (saved to per-model directories)
-# ------------------------------------------------------------------
-
-def plot_model_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray,
-                                model_name: str, out_dir: str) -> None:
-    tp = int(((y_true == 1) & (y_pred == 1)).sum())
-    fp = int(((y_true == 0) & (y_pred == 1)).sum())
-    fn = int(((y_true == 1) & (y_pred == 0)).sum())
-    tn = int(((y_true == 0) & (y_pred == 0)).sum())
-    values = np.array([[tp, fn], [fp, tn]])
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(values, cmap="Oranges")
-    fig.colorbar(im, ax=ax)
-    ax.set_xticks([0, 1])
-    ax.set_yticks([0, 1])
-    ax.set_xticklabels(["Predicted Match", "Predicted Non-Match"])
-    ax.set_yticklabels(["Actual Match", "Actual Non-Match"])
-    ax.set_xlabel("Predicted Label")
-    ax.set_ylabel("Actual Label")
-    ax.set_title(f"Aggregate Confusion Matrix — {model_name}\n(LOSO predictions)")
-    thresh = values.max() / 2.0
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, f"{values[i, j]:,}", ha="center", va="center",
-                    color="white" if values[i, j] > thresh else "black",
-                    fontsize=14, fontweight="bold")
-    plt.setp(ax.get_xticklabels(), rotation=15, ha="right")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "confusion_matrix.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [{model_name}] saved: confusion_matrix.png")
-
-
-def plot_model_roc_curve(y_true: np.ndarray, y_score: np.ndarray,
-                         model_name: str, out_dir: str) -> None:
-    fpr, tpr, _ = roc_curve(y_true, y_score)
-    roc_auc = auc(fpr, tpr)
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(fpr, tpr, color="#DD8452", lw=2, label=f"ROC (AUC = {roc_auc:.4f})")
-    ax.plot([0, 1], [0, 1], color="gray", linestyle="--", lw=1)
-    ax.set_xlim([-0.01, 1.0])
-    ax.set_ylim([0.0, 1.02])
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
-    ax.set_title(f"ROC Curve — {model_name}\n(LOSO predictions)")
-    ax.legend(loc="lower right")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "roc_curve.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [{model_name}] saved: roc_curve.png")
-
-
-def plot_model_metrics_per_set(fold_metrics: list, set_ids: list,
-                               model_name: str, out_dir: str) -> None:
-    metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
-    metric_labels = ["Accuracy", "Precision", "Recall", "F1", "Bal. Acc."]
-    x      = np.arange(len(set_ids))
-    colors = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2"]
-    width  = 0.15
-
-    fig, ax = plt.subplots(figsize=(max(12, len(set_ids) * 0.7), 5))
-    for i, (k, label, c) in enumerate(zip(metric_keys, metric_labels, colors)):
-        vals = [m[k] for m in fold_metrics]
-        ax.bar(x + i * width, vals, width, label=label, color=c)
-
-    ax.set_xticks(x + width * (len(metric_keys) - 1) / 2)
-    ax.set_xticklabels(set_ids, rotation=45, ha="right", fontsize=8)
-    ax.set_ylim(0, 1.08)
-    ax.set_ylabel("Score")
-    ax.set_title(f"Evaluation Metrics per Set — {model_name}")
-    ax.legend(loc="lower right", fontsize=8)
-    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "metrics_per_set.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [{model_name}] saved: metrics_per_set.png")
-
-
-def plot_feature_importance(model, model_name: str, out_dir: str) -> None:
-    importances = model.feature_importances_
-    sorted_idx  = np.argsort(importances)[::-1]
-    sorted_feat = [FEATURE_COLS[i] for i in sorted_idx]
-    sorted_imp  = importances[sorted_idx]
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(sorted_feat, sorted_imp, color="#4C72B0", alpha=0.85)
-    for bar, val in zip(bars, sorted_imp):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
-                f"{val:.4f}", ha="center", va="bottom", fontsize=9)
-    ax.set_ylabel("Importance")
-    ax.set_title(f"Feature Importance — {model_name}\n(trained on all sets)")
-    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "feature_importance.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [{model_name}] saved: feature_importance.png")
-
-
-def plot_model_coefficients(model, model_name: str, out_dir: str) -> None:
-    coef = model.coef_[0] if model.coef_.ndim > 1 else model.coef_
-    sorted_idx  = np.argsort(np.abs(coef))[::-1]
-    sorted_feat = [FEATURE_COLS[i] for i in sorted_idx]
-    sorted_coef = coef[sorted_idx]
-    colors = ["#4C72B0" if v >= 0 else "#DD8452" for v in sorted_coef]
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    bars = ax.bar(sorted_feat, sorted_coef, color=colors, alpha=0.85)
-    for bar, val in zip(bars, sorted_coef):
-        offset = 0.002 if val >= 0 else -0.012
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + offset,
-                f"{val:.4f}", ha="center", va="bottom", fontsize=9)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_ylabel("Coefficient")
-    ax.set_title(f"Feature Coefficients — {model_name}\n"
-                 "(trained on all sets, blue=positive, orange=negative)")
-    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "coefficients.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [{model_name}] saved: coefficients.png")
-
-
-# ------------------------------------------------------------------
-# Comparison plot  (saved to VIZ_DIR root)
-# ------------------------------------------------------------------
-
-def plot_comparison_report(loso_summary: pd.DataFrame, fusion_results: dict, out_dir: str) -> None:
-    metric_keys   = ["accuracy", "precision", "recall", "f1", "balanced_accuracy"]
-    metric_labels = ["Accuracy", "Precision", "Recall", "F1", "Bal. Accuracy"]
-
-    baseline_avg    = {k: float(loso_summary[k].mean()) for k in metric_keys}
-    approach_names  = ["Baseline\n(Hamming LOSO)"] + [f"Fusion\n{n}" for n in fusion_results]
-    approach_values = [baseline_avg] + [r["avg_metrics"] for r in fusion_results.values()]
-    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2"]
-    colors  = (palette * ((len(approach_names) // len(palette)) + 1))[:len(approach_names)]
-
-    n_metrics    = len(metric_keys)
-    n_approaches = len(approach_names)
-    x     = np.arange(n_metrics)
-    width = 0.75 / n_approaches
-
-    fig, ax = plt.subplots(figsize=(14, 6))
-    for i, (name, metrics, color) in enumerate(zip(approach_names, approach_values, colors)):
-        offsets = x + (i - n_approaches / 2 + 0.5) * width
-        vals = [metrics[k] for k in metric_keys]
-        bars = ax.bar(offsets, vals, width, label=name, color=color, alpha=0.85)
-        for bar, val in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.0015,
-                    f"{val:.4f}", ha="center", va="bottom", fontsize=6.5, rotation=90)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(metric_labels, fontsize=11)
-    ax.set_ylim(0, 1.15)
-    ax.set_ylabel("Score")
-    ax.set_title("Score-Level Fusion vs Baseline  (Leave-One-Set-Out CV)", fontsize=12)
-    ax.legend(fontsize=9, loc="lower right")
-    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "comparison_report.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print("  [root] saved: comparison_report.png")
-
-
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
-
-def main() -> None:
-    enabled_dirs = [MODEL_DIRS[name] for name, cfg in MODELS_CONFIG.items() if cfg["enabled"]]
-    for d in [VIZ_DIR] + enabled_dirs:
-        ensure_dir(d)
-
-    print(f"Loading data from: {OUTPUT_ROOT}")
-    per_set_multi = load_all_multi_score_features()
-    total_pairs   = sum(len(df) for df in per_set_multi)
-    print(f"  {len(per_set_multi)} sets | {total_pairs:,} pair records")
-
-    print("\nEnabled models:")
-    for name, cfg in MODELS_CONFIG.items():
-        status = "ON " if cfg["enabled"] else "OFF"
-        if cfg.get("hp_tuning") and cfg.get("param_space"):
-            sub = f" sub={cfg.get('tune_subsample','all')}" if cfg.get("tune_subsample") else ""
-            tune = f" [Optuna n={cfg.get('n_trials',0)} jobs={cfg.get('study_n_jobs',1)}{sub}]"
-        else:
-            tune = ""
-        print(f"  [{status}] {name}{tune}  params={cfg['params']}")
-
-    if not per_set_multi:
-        print("\n  [skip] no multi_score_features.csv found — run baseline script first.")
+def plot_model_metrics_per_set(b: dict, model_name: str, out_dir: str) -> None:
+    """One subplot per metric (accuracy, precision, recall, f1, eer) across folds."""
+    keys    = ["accuracy", "precision", "recall", "f1", "eer"]
+    n_folds = len(b["fold_metrics"])
+    if n_folds == 0:
         return
 
-    # ---- Single unified LOSO loop ----
-    print("\n[LOSO cross-validation — all enabled models]")
-    results = run_loso_evaluation(per_set_multi)
+    set_ids = b["set_ids"]
+    fig, axes = plt.subplots(len(keys), 1,
+                              figsize=(max(10, n_folds * 0.8), 3.2 * len(keys)),
+                              sharex=True)
+    for ax, key in zip(axes, keys):
+        vals = [m.get(key) for m in b["fold_metrics"]]
+        avg  = _safe_mean(vals)
+        ax.bar(set_ids, vals, color="#90CAF9", edgecolor="white")
+        ax.axhline(avg, color="#1565C0", ls="--", lw=1.5,
+                   label=f"Mean = {avg:.4f}")
+        ax.set_ylabel(METRIC_LABELS.get(key, key), fontsize=9)
+        ax.legend(fontsize=8)
 
-    # ---- Baseline plots → visualizations/baseline/ ----
-    baseline_name = "Baseline (Hamming)"
-    if baseline_name in results:
-        res          = results[baseline_name]
-        loso_summary = pd.DataFrame(res["fold_metrics"])
-        loso_pairs   = pd.DataFrame({
-            "distance":   res["all_distances"],
-            "true_label": res["all_y_true"],
-            "pred_label": res["all_y_pred"],
-            "pair_type":  res["all_pair_types"],
-        })
-        out_dir = MODEL_DIRS[baseline_name]
-        print(f"\n[{baseline_name}]")
-        plot_metrics_per_set(loso_summary, out_dir)
-        plot_distance_distributions(loso_pairs, out_dir)
-        plot_roc_curve(loso_pairs, out_dir)
-        plot_det_curve(loso_pairs, out_dir)
-        plot_distance_per_set(loso_summary, out_dir)
-        if "threshold" in loso_summary.columns:
-            plot_loso_threshold_per_set(loso_summary, out_dir)
-        plot_far_frr_per_set(loso_summary, out_dir)
-        plot_aggregate_confusion_matrix(loso_summary, out_dir, title_prefix="Baseline LOSO")
-        plot_dashboard(loso_summary, loso_pairs, out_dir)
+    axes[-1].tick_params(axis="x", rotation=45)
+    fig.suptitle(f"Per-Fold Metrics — {model_name}", y=1.01, fontsize=13)
+    plt.tight_layout()
+    _save(fig, os.path.join(out_dir, "metrics_per_fold.png"))
 
-    # ---- Fusion model plots → per-model dirs ----
-    fusion_results = {name: res for name, res in results.items() if name != baseline_name}
-    for model_name, res in fusion_results.items():
-        out_dir = MODEL_DIRS.get(model_name, VIZ_DIR)
-        print(f"\n[{model_name}]")
-        plot_model_confusion_matrix(res["all_y_true"], res["all_y_pred"], model_name, out_dir)
-        plot_model_roc_curve(res["all_y_true"], res["all_y_score"], model_name, out_dir)
-        plot_model_metrics_per_set(res["fold_metrics"], res["set_ids"], model_name, out_dir)
-        final = res["final_model"]
-        if hasattr(final, "feature_importances_"):
-            plot_feature_importance(final, model_name, out_dir)
-        elif hasattr(final, "coef_"):
-            plot_model_coefficients(final, model_name, out_dir)
+
+def plot_far_frr_curve(b: dict, model_name: str, out_dir: str,
+                       is_distance: bool = False) -> None:
+    """
+    FAR / FRR per test set (thin lines) + aggregate (bold), with EER markers.
+
+    is_distance=True  — x-axis is Hamming distance threshold (baseline).
+    is_distance=False — x-axis is probability / score threshold.
+    """
+    is_dist  = b.get("score_is_distance", False)
+    fold_dfs = b.get("fold_dfs", [])
+    set_ids  = b.get("set_ids", [f"fold_{i+1:02d}" for i in range(len(fold_dfs))])
+    xlabel   = "Hamming Distance Threshold" if is_dist else "Score Threshold"
+
+    fig, ax  = plt.subplots(figsize=(9, 6))
+    per_eers = []
+
+    # ---- Per-set thin curves ----
+    for df in fold_dfs:
+        y_true = df["y_true"].values.astype(int)
+        y_raw  = df["y_score"].values.astype(float)
+        y_roc  = 1.0 - y_raw if is_dist else y_raw
+        try:
+            fpr, tpr, thr = roc_curve(y_true, y_roc)
+        except Exception:
+            continue
+        x_s = (1.0 - thr[1:]) if is_dist else thr[1:]
+        ax.plot(x_s, fpr[1:],           color=_PALETTE["far"], lw=0.7, alpha=0.25)
+        ax.plot(x_s, 1.0 - tpr[1:],    color=_PALETTE["frr"], lw=0.7, alpha=0.25, ls="--")
+        try:
+            eer_s, eer_t_s = _compute_eer(y_true, y_roc)
+            eer_x_s = float(1.0 - eer_t_s) if is_dist else float(eer_t_s)
+            ax.scatter([eer_x_s], [eer_s], color="gray", s=18, zorder=4)
+            per_eers.append(eer_s)
+        except Exception:
+            pass
+
+    # ---- Aggregate bold curves ----
+    y_roc_all        = _genuine_score(b)
+    fpr_a, tpr_a, thr_a = roc_curve(b["all_y_true"], y_roc_all)
+    x_a   = (1.0 - thr_a[1:]) if is_dist else thr_a[1:]
+    far_a = fpr_a[1:]
+    frr_a = 1.0 - tpr_a[1:]
+    eer_a, eer_t_a = _compute_eer(b["all_y_true"], y_roc_all)
+    eer_x_a  = float(1.0 - eer_t_a) if is_dist else float(eer_t_a)
+    mean_eer = float(np.mean(per_eers)) if per_eers else eer_a
+
+    ax.plot(x_a, far_a, color=_PALETTE["far"], lw=2.5)
+    ax.plot(x_a, frr_a, color=_PALETTE["frr"], lw=2.5, ls="--")
+    ax.axvline(eer_x_a, color=_PALETTE["eer"], ls="--", lw=1.5)
+    ax.scatter([eer_x_a], [eer_a], color=_PALETTE["eer"], zorder=5, s=70)
+
+    # ---- Legend (manual handles) ----
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([0],[0], color=_PALETTE["far"], lw=2.5,
+               label="FAR — aggregate"),
+        Line2D([0],[0], color=_PALETTE["frr"], lw=2.5, ls="--",
+               label="FRR — aggregate"),
+        Line2D([0],[0], color=_PALETTE["far"], lw=0.8, alpha=0.5,
+               label=f"FAR — per set  (n={len(fold_dfs)})"),
+        Line2D([0],[0], color=_PALETTE["frr"], lw=0.8, alpha=0.5, ls="--",
+               label=f"FRR — per set  (n={len(fold_dfs)})"),
+        Line2D([0],[0], color=_PALETTE["eer"], ls="--", lw=1.5,
+               label=f"EER = {eer_a:.4f}  (per-set mean = {mean_eer:.4f})"),
+        Line2D([0],[0], marker="o", color="w", markerfacecolor="gray",
+               markersize=5, label="EER per set"),
+    ]
+    ax.legend(handles=handles, fontsize=8)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Rate")
+    ax.set_ylim(0, 1)
+    ax.set_title(f"FAR / FRR per Set — {model_name}")
+    _save(fig, os.path.join(out_dir, "far_frr_curve.png"))
+
+
+def plot_feature_importance(b: dict, model_name: str, out_dir: str) -> None:
+    """Horizontal bar chart — feature_importances_ (RF, XGBoost, Baseline)."""
+    model = b.get("final_model")
+    if model is None:
+        return
+    try:
+        imps = model.feature_importances_
+    except Exception:
+        return
+    indices = np.argsort(imps)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.barh([FEATURE_COLS[i] for i in indices], imps[indices], color="#42A5F5")
+    ax.set_xlabel("Importance")
+    ax.set_title(f"Feature Importance — {model_name}")
+    _save(fig, os.path.join(out_dir, "feature_importance.png"))
+
+
+def plot_model_coefficients(b: dict, model_name: str, out_dir: str) -> None:
+    """Bar chart of LR coefficients from the final model."""
+    model = b.get("final_model")
+    if model is None:
+        return
+    try:
+        coefs = model.coef_.ravel()
+    except Exception:
+        return
+    colors = ["#42A5F5" if c >= 0 else "#EF5350" for c in coefs]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(FEATURE_COLS, coefs, color=colors)
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_ylabel("Coefficient")
+    ax.set_title(f"Logistic Regression Coefficients — {model_name}")
+    _save(fig, os.path.join(out_dir, "coefficients.png"))
+
+
+# ==================================================================
+# Per-model dashboard
+# ==================================================================
+
+def plot_model_dashboard(b: dict, model_name: str, out_dir: str) -> None:
+    """
+    Summary dashboard: metric cards (avg ± std) on top,
+    per-fold bar charts on the bottom.
+    Metrics: Accuracy, Balanced Accuracy, Precision, Recall, F1.
+    """
+    from matplotlib.gridspec import GridSpec
+
+    keys = ["accuracy", "balanced_accuracy", "precision", "recall", "f1"]
+    card_labels = {
+        "accuracy":          "Accuracy",
+        "balanced_accuracy": "Balanced\nAccuracy",
+        "precision":         "Precision",
+        "recall":            "Recall",
+        "f1":                "F1 Score",
+    }
+    folds = b["fold_metrics"]
+    sids  = b["set_ids"]
+    n_f   = len(folds)
+    if n_f == 0:
+        return
+
+    n   = len(keys)
+    fig = plt.figure(figsize=(4 * n, 8))
+    gs  = GridSpec(2, n, figure=fig,
+                   height_ratios=[1, 2.5], hspace=0.45, wspace=0.3)
+
+    for j, key in enumerate(keys):
+        vals = [m.get(key) for m in folds]
+        avg  = _safe_mean(vals)
+        std  = _safe_std(vals)
+
+        # ---- Summary card (row 0) ----
+        ax_c = fig.add_subplot(gs[0, j])
+        bg   = "#C8E6C9" if avg >= 0.8 else ("#FFF9C4" if avg >= 0.6 else "#FFCDD2")
+        ax_c.set_facecolor(bg)
+        ax_c.tick_params(left=False, bottom=False,
+                         labelleft=False, labelbottom=False)
+        for sp in ax_c.spines.values():
+            sp.set_edgecolor("#BDBDBD")
+            sp.set_linewidth(0.8)
+        ax_c.text(0.5, 0.70, f"{avg:.4f}",
+                  ha="center", va="center", fontsize=20, fontweight="bold",
+                  transform=ax_c.transAxes)
+        ax_c.text(0.5, 0.36, f"± {std:.4f}",
+                  ha="center", va="center", fontsize=10, color="#555555",
+                  transform=ax_c.transAxes)
+        ax_c.text(0.5, 0.93, card_labels[key],
+                  ha="center", va="top", fontsize=10, fontweight="bold",
+                  transform=ax_c.transAxes)
+
+        # ---- Per-fold bar chart (row 1) ----
+        ax_b  = fig.add_subplot(gs[1, j])
+        x_pos = np.arange(n_f)
+        plot_vals = [v if v is not None else float("nan") for v in vals]
+        ax_b.bar(x_pos, plot_vals, color="#90CAF9", edgecolor="white", width=0.8)
+        ax_b.axhline(avg, color="#1565C0", ls="--", lw=1.2,
+                     label=f"Mean = {avg:.3f}")
+        ax_b.set_ylim(0, 1.05)
+
+        if n_f <= 20:
+            ax_b.set_xticks(x_pos)
+            ax_b.set_xticklabels(sids, rotation=90, fontsize=6)
         else:
-            print(f"  [{model_name}] skipped: no coefficient/importance attribute")
+            step = max(1, n_f // 10)
+            ax_b.set_xticks(x_pos[::step])
+            ax_b.set_xticklabels(
+                [sids[i] for i in range(0, n_f, step)],
+                rotation=90, fontsize=6)
 
-    # ---- Comparison → visualizations/ (root) ----
-    if fusion_results and baseline_name in results:
-        print("\n[comparison]")
-        plot_comparison_report(loso_summary, fusion_results, VIZ_DIR)
+        ax_b.set_title(card_labels[key], fontsize=9)
+        ax_b.tick_params(axis="y", labelsize=8)
+        ax_b.legend(fontsize=7, loc="lower right")
 
-    print("\nDone.")
-    for name, cfg in MODELS_CONFIG.items():
-        if cfg["enabled"]:
-            slug = MODEL_DIRS[name].split(os.sep)[-1]
-            print(f"  {slug}/  → {MODEL_DIRS[name]}")
-    print(f"  comparison_report.png  → {VIZ_DIR}")
+    fig.suptitle(f"Evaluation Dashboard — {model_name}",
+                 fontsize=14, fontweight="bold", y=1.01)
+    _save(fig, os.path.join(out_dir, "dashboard.png"))
+
+
+# ==================================================================
+# Root / comparison visualizations
+# ==================================================================
+
+def plot_global_distance_distribution(per_set_dfs: list, out_dir: str) -> None:
+    """2×2 panel: Hamming, Jaccard, Cosine, Pearson — genuine vs impostor."""
+    if not per_set_dfs:
+        return
+    all_df = pd.concat(per_set_dfs, ignore_index=True)
+    if "pair_type" in all_df.columns:
+        is_gen = all_df["pair_type"] == "genuine"
+    elif "true_label" in all_df.columns:
+        is_gen = all_df["true_label"] == 1
+    else:
+        print("  [warn] no pair_type or true_label column — skipping global distribution")
+        return
+
+    col_labels = {
+        "hamming": "Hamming Distance",
+        "jaccard": "Jaccard Distance",
+        "cosine":  "Cosine Distance",
+        "pearson": "Pearson Distance",
+    }
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    for ax, col in zip(axes.flat, FEATURE_COLS):
+        if col not in all_df.columns:
+            ax.set_visible(False)
+            continue
+        gen_vals = all_df.loc[is_gen,  col].dropna().values
+        imp_vals = all_df.loc[~is_gen, col].dropna().values
+        if len(gen_vals) == 0 or len(imp_vals) == 0:
+            ax.set_visible(False)
+            continue
+        lo   = min(gen_vals.min(), imp_vals.min())
+        hi   = max(gen_vals.max(), imp_vals.max())
+        bins = np.linspace(lo, hi, 80)
+        ax.hist(gen_vals, bins=bins, density=True, alpha=0.55,
+                color=_PALETTE["genuine"],  label=f"Genuine  (n={len(gen_vals):,})")
+        ax.hist(imp_vals, bins=bins, density=True, alpha=0.55,
+                color=_PALETTE["impostor"], label=f"Impostor (n={len(imp_vals):,})")
+        label = col_labels.get(col, col)
+        ax.set_xlabel(label)
+        ax.set_ylabel("Density")
+        ax.set_title(label)
+        ax.legend(fontsize=8)
+
+    fig.suptitle("All-Set Distance Distributions — Genuine vs Impostor",
+                 fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    _save(fig, os.path.join(out_dir, "global_distance_distribution.png"))
+
+
+def plot_metrics_summary_table(results: dict, out_dir: str) -> None:
+    """PNG table: rows = models, cols = avg metrics."""
+    metric_keys = ["accuracy", "precision", "recall", "f1", "eer"]
+    rows = []
+    for name, b in results.items():
+        if b is None:
+            continue
+        am = b["avg_metrics"]
+        rows.append([name] + [
+            f"{am.get(k, float('nan')):.4f}" for k in metric_keys
+        ])
+    if not rows:
+        return
+
+    col_headers = ["Model"] + [METRIC_LABELS.get(k, k) for k in metric_keys]
+    fig_h = max(2.5, len(rows) * 0.65 + 1.5)
+    fig_w = len(col_headers) * 2.2
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    tbl = ax.table(cellText=rows, colLabels=col_headers,
+                   loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1, 1.9)
+    for j in range(len(col_headers)):
+        tbl[0, j].set_facecolor("#1565C0")
+        tbl[0, j].set_text_props(color="white", fontweight="bold")
+    for i in range(1, len(rows) + 1):
+        bg = "#E3F2FD" if i % 2 == 0 else "white"
+        for j in range(len(col_headers)):
+            tbl[i, j].set_facecolor(bg)
+    ax.set_title("Model Evaluation Summary (LOSO avg)",
+                 pad=20, fontsize=13, fontweight="bold")
+    _save(fig, os.path.join(out_dir, "metrics_summary_table.png"))
+
+
+def plot_comparison_report(results: dict, out_dir: str) -> None:
+    """Side-by-side bar charts comparing all models on key metrics."""
+    metric_keys = ["accuracy", "precision", "recall", "f1", "eer"]
+    model_names = [n for n, b in results.items() if b is not None]
+    if not model_names:
+        return
+
+    colors = plt.cm.tab10(np.linspace(0, 0.8, len(model_names)))
+    fig, axes = plt.subplots(1, len(metric_keys),
+                              figsize=(4.5 * len(metric_keys), 5))
+    if len(metric_keys) == 1:
+        axes = [axes]
+
+    for ax, key in zip(axes, metric_keys):
+        vals = [results[n]["avg_metrics"].get(key, float("nan"))
+                for n in model_names]
+        bars = ax.bar(range(len(model_names)), vals, color=colors)
+        ax.set_xticks(range(len(model_names)))
+        ax.set_xticklabels([n.replace(" ", "\n") for n in model_names], fontsize=8)
+        ax.set_title(METRIC_LABELS.get(key, key), fontsize=10)
+        finite = [v for v in vals if not np.isnan(v)]
+        ax.set_ylim(0, max(1.0, max(finite) * 1.15) if finite else 1.0)
+        for bar, v in zip(bars, vals):
+            if not np.isnan(v):
+                ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01,
+                        f"{v:.3f}", ha="center", va="bottom", fontsize=7)
+
+    fig.suptitle("Model Comparison Report", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    _save(fig, os.path.join(out_dir, "comparison_report.png"))
+
+
+# ==================================================================
+# Main
+# ==================================================================
+
+def main() -> None:
+    ensure_dir(VIZ_DIR)
+
+    print(f"Loading distance features from: {OUTPUT_ROOT}")
+    per_set_dfs = load_all_multi_score_features()
+    print(f"  {len(per_set_dfs)} set(s) found")
+
+    print("\n[Root] global distance distribution (2×2 panel)")
+    plot_global_distance_distribution(per_set_dfs, VIZ_DIR)
+
+    results = {}
+    for model_name in MODEL_DIRS:
+        print(f"\n[{model_name}] loading results ...")
+        b = load_model_results(model_name)
+        results[model_name] = b
+        if b is None:
+            print("  no fold CSVs found — skipping")
+            continue
+
+        n_folds = len(b["fold_metrics"])
+        eer_avg = b["avg_metrics"].get("eer", float("nan"))
+        print(f"  {n_folds} fold(s) | avg EER = {eer_avg:.4f}")
+
+        slug    = _model_slug(model_name)
+        out_dir = ensure_dir(os.path.join(OUTPUT_ROOT, slug))
+        is_base = b.get("score_is_distance", False)
+
+        if is_base:
+            plot_distance_distributions(b, out_dir)
+            plot_loso_threshold_per_set(b, out_dir)
+
+        plot_model_dashboard(b, model_name, out_dir)
+        plot_model_confusion_matrix(b, model_name, out_dir)
+        plot_model_roc_curve(b, model_name, out_dir)
+        plot_model_metrics_per_set(b, model_name, out_dir)
+        plot_far_frr_curve(b, model_name, out_dir, is_distance=is_base)
+
+        if b.get("final_model") is not None:
+            plot_feature_importance(b, model_name, out_dir)
+            plot_model_coefficients(b, model_name, out_dir)
+
+    print("\n[Root] metrics summary table")
+    plot_metrics_summary_table(results, VIZ_DIR)
+
+    print("\n[Root] comparison report")
+    plot_comparison_report(results, VIZ_DIR)
+
+    print("\nDone. Outputs:")
+    print(f"  {VIZ_DIR}/")
+    for model_name, b in results.items():
+        if b is not None:
+            slug = _model_slug(model_name)
+            print(f"  {OUTPUT_ROOT}/{slug}/")
 
 
 if __name__ == "__main__":
