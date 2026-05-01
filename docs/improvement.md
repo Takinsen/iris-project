@@ -168,7 +168,6 @@ Each tuned model has a dedicated `_*_space(trial)` function that maps an Optuna 
 |---|---|---|
 | `_rf_space` | Random Forest | `n_estimators` [100–300], `max_depth` {None,5,10}, `min_samples_split` [2–20], `min_samples_leaf` [1–10] |
 | `_lr_space` | Logistic Regression | `C` log-uniform in [1e-4, 1e2] |
-| `_xgb_space` | XGBoost | `n_estimators` [50–500], `max_depth` [2–8], `learning_rate` log-uniform [1e-5, 0.5], `subsample` [0.5–1.0], `colsample_bytree` [0.5–1.0], `min_child_weight` [1–30], `gamma` [0–20], `reg_alpha` log-uniform [1e-6, 10], `reg_lambda` log-uniform [1e-6, 10] |
 
 MLP does not use Optuna — it runs with fixed `params` directly.
 
@@ -219,7 +218,6 @@ cv_jobs = 1 if (model_is_parallel or study_jobs != 1) else -1
 |---|---|---|---|
 | Random Forest | 1 | 1 | RF uses `n_jobs=-1` internally; no nesting |
 | Logistic Regression | 4 | 1 | Study is parallel; avoid nested threads |
-| XGBoost | 1 | 1 | XGBoost uses `n_jobs=-1` internally; no nesting |
 | MLP | 1 | — | No Optuna; fits directly on full training slice |
 
 ### Best Params Logging
@@ -228,7 +226,7 @@ After each fold, found parameters are printed and stored in `fold_metrics["best_
 
 ```
   [LOSO] fold 3/10 ...
-    [XGBoost] best params: {'n_estimators': 312, 'max_depth': 4, 'learning_rate': 0.042, ...}
+    [Random Forest] best params: {'n_estimators': 250, 'max_depth': 10, ...}
 ```
 
 ---
@@ -276,10 +274,6 @@ Ensemble of decision trees. `class_weight="balanced"` compensates for the ~54:1 
 
 Linear classifier. Tuned parameter `C` (inverse regularisation strength). `class_weight="balanced"` and `max_iter=2000` ensure convergence on large imbalanced datasets.
 
-### XGBoost
-
-Gradient-boosted tree ensemble. `scale_pos_weight=50` compensates for the ~54:1 impostor/genuine imbalance (equivalent to `class_weight="balanced"` for XGBoost). `tree_method="hist"` uses histogram-based splits for speed. `n_jobs=-1` uses all CPU cores. `tune_subsample=50_000` caps the Optuna search rows. The search space covers 9 hyperparameters including regularisation terms `reg_alpha` and `reg_lambda`.
-
 ### MLP (Multi-Layer Perceptron)
 
 Neural network classifier with fixed architecture `(128, 64)` hidden layers. Hyperparameter tuning is disabled (`hp_tuning=False`) — the model uses fixed `alpha=1e-4` and `learning_rate_init=1e-3`. MLP does not expose `feature_importances_` or `coef_`, so feature importance plots are skipped for this model.
@@ -323,7 +317,6 @@ The same metric set is used for all models:
 | `baseline/` | Baseline (Hamming) |
 | `random_forest/` | Random Forest |
 | `logistic_regression/` | Logistic Regression |
-| `xgboost/` | XGBoost |
 | `mlp/` | MLP |
 
 Each model directory contains:
@@ -333,7 +326,7 @@ Each model directory contains:
 | `confusion_matrix.png` | Aggregate TP/FP/FN/TN across all LOSO predictions | All |
 | `roc_curve.png` | ROC curve (AUC) across all LOSO predictions | All |
 | `metrics_per_set.png` | Bar chart of per-fold metrics | All |
-| `feature_importance.png` | Feature importances (`feature_importances_`) from final model | Random Forest, XGBoost |
+| `feature_importance.png` | Feature importances (`feature_importances_`) from final model | Random Forest, Baseline |
 | `coefficients.png` | Feature coefficients (`coef_`) from final model | Logistic Regression |
 
 ### Comparison report — `visualizations/comparison_report.png`
@@ -362,8 +355,6 @@ Grouped bar chart placing the Baseline LOSO result side-by-side with each fusion
       confusion_matrix.png  roc_curve.png  metrics_per_set.png  feature_importance.png
     logistic_regression/
       confusion_matrix.png  roc_curve.png  metrics_per_set.png  coefficients.png
-    xgboost/
-      confusion_matrix.png  roc_curve.png  metrics_per_set.png  feature_importance.png
     mlp/
       confusion_matrix.png  roc_curve.png  metrics_per_set.png
 ```

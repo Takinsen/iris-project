@@ -54,15 +54,16 @@ TARGET_EYE_SIDE = "L"
 OUTPUT_ROOT    = rf".\out_CASIA_Iris_Thousand_MultiSet_{TARGET_EYE_SIDE}"
 MODEL_SAVE_DIR = os.path.join(".", "model")
 VIZ_DIR        = os.path.join(OUTPUT_ROOT, "visualization")
-FEATURE_COLS   = ["hamming", "jaccard", "cosine", "pearson"]
+FEATURE_COLS   = ["hamming", "jaccard", "weighted_euclidean", "pearson"]
 
 MODEL_DIRS = {
     "Baseline (Hamming)": "baseline_hamming",
     "Random Forest":      "random_forest",
     "Logistic Regression": "logistic_regression",
-    "XGBoost":            "xgboost",
     "MLP":                "mlp",
 }
+
+TARGET_FAR = 1e-5   # operating point for confusion matrix (FAR ≤ this value)
 
 _PALETTE = {
     "genuine":  "#2196F3",
@@ -107,6 +108,15 @@ def _compute_eer(y_true: np.ndarray, y_score: np.ndarray) -> tuple:
     fnr = 1.0 - tpr
     idx = np.argmin(np.abs(fpr - fnr))
     return float((fpr[idx] + fnr[idx]) / 2.0), float(thresholds[idx])
+
+
+def _threshold_at_far(y_true: np.ndarray, y_score: np.ndarray,
+                      target_far: float = TARGET_FAR) -> float:
+    """Returns the score threshold that achieves the highest TPR with FAR ≤ target_far."""
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    valid = np.where(fpr <= target_far)[0]
+    idx = int(valid[-1]) if len(valid) > 0 else 0
+    return float(thresholds[idx])
 
 
 def _genuine_score(b: dict) -> np.ndarray:
@@ -253,7 +263,7 @@ def plot_loso_threshold_per_set(b: dict, out_dir: str) -> None:
 # ==================================================================
 
 def plot_model_confusion_matrix(b: dict, model_name: str, out_dir: str) -> None:
-    """Aggregate confusion matrix at the per-fold EER threshold."""
+    """Aggregate confusion matrix at the per-fold threshold where FAR ≤ TARGET_FAR."""
     is_dist  = b.get("score_is_distance", False)
     tp = fp = fn = tn = 0
 
@@ -262,10 +272,10 @@ def plot_model_confusion_matrix(b: dict, model_name: str, out_dir: str) -> None:
         y_raw  = df["y_score"].values.astype(float)
         y_roc  = 1.0 - y_raw if is_dist else y_raw
         try:
-            _, eer_thr = _compute_eer(y_true, y_roc)
+            thr = _threshold_at_far(y_true, y_roc, TARGET_FAR)
         except Exception:
             continue
-        y_pred = (y_roc >= eer_thr).astype(int)
+        y_pred = (y_roc >= thr).astype(int)
         tp += int(((y_true == 1) & (y_pred == 1)).sum())
         fp += int(((y_true == 0) & (y_pred == 1)).sum())
         fn += int(((y_true == 1) & (y_pred == 0)).sum())
@@ -286,7 +296,8 @@ def plot_model_confusion_matrix(b: dict, model_name: str, out_dir: str) -> None:
     ax.set_yticks([0, 1])
     ax.set_xticklabels(["Pred Genuine", "Pred Impostor"])
     ax.set_yticklabels(["Actual Genuine", "Actual Impostor"])
-    ax.set_title(f"Aggregate Confusion Matrix — {model_name}")
+    ax.set_title(f"Aggregate Confusion Matrix — {model_name}\n"
+                 f"(threshold @ FAR ≤ {TARGET_FAR:.0e})")
     _save(fig, os.path.join(out_dir, "confusion_matrix.png"))
 
 
@@ -409,7 +420,7 @@ def plot_far_frr_curve(b: dict, model_name: str, out_dir: str,
 
 
 def plot_feature_importance(b: dict, model_name: str, out_dir: str) -> None:
-    """Horizontal bar chart — feature_importances_ (RF, XGBoost, Baseline)."""
+    """Horizontal bar chart — feature_importances_ (RF, Baseline)."""
     model = b.get("final_model")
     if model is None:
         return
@@ -544,10 +555,10 @@ def plot_global_distance_distribution(per_set_dfs: list, out_dir: str) -> None:
         return
 
     col_labels = {
-        "hamming": "Hamming Distance",
-        "jaccard": "Jaccard Distance",
-        "cosine":  "Cosine Distance",
-        "pearson": "Pearson Distance",
+        "hamming":             "Hamming Distance",
+        "jaccard":             "Jaccard Distance",
+        "weighted_euclidean":  "Weighted Euclidean Distance",
+        "pearson":             "Pearson Distance",
     }
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     for ax, col in zip(axes.flat, FEATURE_COLS):
@@ -676,6 +687,8 @@ def main() -> None:
         slug    = _model_slug(model_name)
         out_dir = ensure_dir(os.path.join(OUTPUT_ROOT, slug))
         is_base = b.get("score_is_distance", False)
+
+        plot_global_distance_distribution(per_set_dfs, out_dir)
 
         if is_base:
             plot_distance_distributions(b, out_dir)

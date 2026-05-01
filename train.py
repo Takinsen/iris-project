@@ -10,7 +10,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_score
-from xgboost import XGBClassifier
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -21,18 +20,25 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 class HammingThresholdClassifier:
     """
-    Fixed Hamming-distance threshold classifier.
-    fit()           → no-op; threshold stays at the value set in __init__.
+    Hamming-distance threshold classifier.
+    fit()           → finds the Hamming threshold at FAR ≤ target_far on training pairs.
     predict_proba() → column 1 = raw Hamming distance (score_is_distance=True).
     feature_importances_ → [1, 0, 0, 0] for plot compatibility.
     """
 
     score_is_distance = True   # lower score = more genuine
 
-    def __init__(self, threshold: float = 0.38):
-        self.threshold_ = threshold
+    def __init__(self, target_far: float = 1e-5):
+        self.target_far  = target_far
+        self.threshold_  = 0.38   # fallback; overwritten by fit()
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HammingThresholdClassifier":
+        ham   = np.clip(X[:, 0], 0.0, 1.0)
+        y_roc = 1.0 - ham                    # flip: higher = more genuine for roc_curve
+        fpr, tpr, thr = roc_curve(y, y_roc)
+        valid = np.where(fpr <= self.target_far)[0]
+        idx   = int(valid[-1]) if len(valid) > 0 else 0
+        self.threshold_ = float(1.0 - thr[idx])   # convert back to Hamming space
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -44,7 +50,7 @@ class HammingThresholdClassifier:
 
     @property
     def feature_importances_(self) -> np.ndarray:
-        imp    = np.zeros(4)   # hamming, jaccard, cosine, pearson
+        imp    = np.zeros(4)   # hamming, jaccard, weighted_euclidean, pearson
         imp[0] = 1.0
         return imp
 
@@ -56,7 +62,7 @@ class HammingThresholdClassifier:
 TARGET_EYE_SIDE = "L"   # "L" or "R"
 OUTPUT_ROOT    = rf".\out_CASIA_Iris_Thousand_MultiSet_{TARGET_EYE_SIDE}"
 MODEL_SAVE_DIR = os.path.join(".", "model")
-FEATURE_COLS   = ["hamming", "jaccard", "cosine", "pearson"]
+FEATURE_COLS   = ["hamming", "jaccard", "weighted_euclidean", "pearson"]
 USE_CACHE      = True   # skip fold training when fold CSV already exists
 
 
@@ -79,20 +85,6 @@ def _lr_space(trial):
     }
 
 
-def _xgb_space(trial):
-    return {
-        "n_estimators":     trial.suggest_int("n_estimators", 50, 500),
-        "max_depth":        trial.suggest_int("max_depth", 2, 8),
-        "learning_rate":    trial.suggest_float("learning_rate", 1e-5, 0.5, log=True),
-        "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-        "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
-        "gamma":            trial.suggest_float("gamma", 0.0, 20.0),
-        "reg_alpha":        trial.suggest_float("reg_alpha", 1e-6, 10.0, log=True),
-        "reg_lambda":       trial.suggest_float("reg_lambda", 1e-6, 10.0, log=True),
-    }
-
-
 # ------------------------------------------------------------------
 # Model Configuration
 # Toggle `enabled` to include/exclude a model.
@@ -103,7 +95,7 @@ MODELS_CONFIG = {
     "Baseline (Hamming)": {
         "enabled":        True,
         "hp_tuning":      False,
-        "params":         {"threshold": 0.38},
+        "params":         {"target_far": 1e-5},
         "param_space":    None,
         "n_trials":       0,
         "study_n_jobs":   1,
@@ -135,21 +127,6 @@ MODELS_CONFIG = {
         "study_n_jobs":   4,
         "tune_subsample": None,
     },
-    "XGBoost": {
-        "enabled":        False,
-        "hp_tuning":      True,
-        "params": {
-            "scale_pos_weight": 50,
-            "random_state":     42,
-            "n_jobs":           -1,
-            "verbosity":        0,
-            "tree_method":      "hist",
-        },
-        "param_space":    _xgb_space,
-        "n_trials":       25,
-        "study_n_jobs":   1,
-        "tune_subsample": 50_000,
-    },
     "MLP": {
         "enabled":        False,
         "hp_tuning":      False,
@@ -176,7 +153,6 @@ _CONSTRUCTORS = {
     "Baseline (Hamming)": HammingThresholdClassifier,
     "Random Forest":      RandomForestClassifier,
     "Logistic Regression": LogisticRegression,
-    "XGBoost":            XGBClassifier,
     "MLP":                MLPClassifier,
 }
 

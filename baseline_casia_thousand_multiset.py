@@ -32,7 +32,7 @@ VALID_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 USE_CACHE = True
 OVERWRITE_CACHE = False
 
-FEATURE_COLS = ["hamming", "jaccard", "cosine", "pearson"]
+FEATURE_COLS = ["hamming", "jaccard", "weighted_euclidean", "pearson"]
 
 
 # -----------------------------
@@ -549,10 +549,10 @@ def compute_extra_scores(
     tpl_a: iris.IrisTemplate,
     tpl_b: iris.IrisTemplate,
 ) -> Dict[str, float]:
-    """Compute Jaccard, Cosine, Pearson and Tanimoto distances for a pre-deserialized pair."""
+    """Compute Jaccard, Weighted Euclidean, and Pearson distances for a pre-deserialized pair."""
     a, b = extract_valid_bits(tpl_a, tpl_b)
     if len(a) == 0:
-        return {"jaccard": np.nan, "cosine": np.nan, "pearson": np.nan, "tanimoto": np.nan}
+        return {"jaccard": np.nan, "weighted_euclidean": np.nan, "pearson": np.nan}
 
     a_bin, b_bin = a > 0.5, b > 0.5
 
@@ -561,16 +561,18 @@ def compute_extra_scores(
     union = float(np.sum(a_bin | b_bin))
     jaccard = 1.0 - (inter / union) if union > 0 else 1.0
 
-    # Cosine
-    dot = float(np.dot(a, b))
-    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
-    cosine = 1.0 - (dot / (na * nb)) if (na * nb) > 0 else 1.0
+    # Weighted Euclidean: L2 distance weighted by per-position activation magnitude.
+    # Positions active in neither template (both 0) contribute no weight, making
+    # the metric sensitive to the pattern of set bits rather than unset ones.
+    weights = np.maximum(a, b) + 1e-6
+    diff_sq = (a - b) ** 2
+    weighted_euclidean = float(np.sqrt(np.dot(weights, diff_sq) / weights.sum()))
 
     # Pearson correlation distance
     sa, sb = float(a.std()), float(b.std())
     pearson = 1.0 - float(np.corrcoef(a, b)[0, 1]) if (sa > 0 and sb > 0) else 1.0
 
-    return {"jaccard": jaccard, "cosine": cosine, "pearson": pearson}
+    return {"jaccard": jaccard, "weighted_euclidean": weighted_euclidean, "pearson": pearson}
 
 
 def build_multi_score_pair_df(
